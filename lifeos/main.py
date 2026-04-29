@@ -14,6 +14,7 @@ from lifeos.agent import (
     ensure_persona,
     ensure_reflection_summaries,
     grouped_persona_memories,
+    inferred_persona_profile_summary,
     latest_completed_local_day,
     persona_stable_profile,
     record_chat_turn,
@@ -21,7 +22,9 @@ from lifeos.agent import (
     run_job,
 )
 from lifeos.auth import clear_session_cookie, require_user, set_session_cookie, verify_password
+from lifeos.config import settings
 from lifeos.db import get_db, init_db
+from lifeos.llm import wait_for_ollama_ready
 from lifeos.models import AgentRun, ChatMessage, ChatSession, DashboardCard, ReflectionSummary, TimeItem
 from lifeos.schemas import ChatRequest, ChatResponse, LoginRequest, PersonaStableProfileUpdate, RawEntryCreate, RawEntryOut, SnoozeRequest
 from lifeos.scheduler import start_scheduler, stop_scheduler
@@ -32,6 +35,8 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    if settings.lifeos_env != "development":
+        wait_for_ollama_ready()
     db = next(get_db())
     try:
         ensure_persona(db)
@@ -115,8 +120,9 @@ def overview(db: Session = Depends(get_db), _user=Depends(require_user)) -> dict
     payload = card.payload or {}
     return {
         "generated_at": payload.get("generated_at") or card.created_at.isoformat(),
-        "card_title": payload.get("card_title") or card.title,
-        "card_message": payload.get("card_message") or card.summary,
+        "brief_title": payload.get("brief_title") or card.title,
+        "brief_message": payload.get("brief_message") or card.summary,
+        "brief_payload": payload.get("brief_payload", {}),
         "milestones": payload.get("milestones") or [
             {
                 "id": summary.id,
@@ -194,6 +200,7 @@ def persona(db: Session = Depends(get_db), _user=Depends(require_user)) -> dict:
     return {
         "stable_profile": persona_stable_profile(profile),
         "inferred_groups": grouped_persona_memories(db),
+        "inferred_profile_summary": inferred_persona_profile_summary(db, profile),
         "updated_at": profile.updated_at.isoformat(),
     }
 
@@ -208,38 +215,19 @@ def update_persona(
     updates = payload.model_dump(exclude_unset=True)
     profile = dict(persona.profile or {})
 
-    for field in ("birth_year", "gender", "locale", "timezone"):
-        if field in updates:
-            setattr(persona, field, updates[field])
-
-    list_fields = {"focus_areas", "values", "preferences", "constraints", "goals"}
-    profile_fields = {
-        "name",
-        "life_stage",
-        "personality_summary",
-        "wellbeing_baseline",
-        "focus_areas",
-        "values",
-        "preferences",
-        "constraints",
-        "goals",
-    }
-    for field in profile_fields:
-        if field not in updates:
-            continue
-        if field in list_fields:
-            profile[field] = list(updates[field] or [])
-        else:
-            profile[field] = updates[field] or ""
+    if "gender" in updates:
+        persona.gender = updates["gender"]
+    if "name" in updates:
+        profile["name"] = updates["name"] or ""
 
     persona.profile = profile
-    persona.goals = list(profile.get("goals") or [])
     db.commit()
     refresh_overview_card(db)
     db.refresh(persona)
     return {
         "stable_profile": persona_stable_profile(persona),
         "inferred_groups": grouped_persona_memories(db),
+        "inferred_profile_summary": inferred_persona_profile_summary(db, persona),
         "updated_at": persona.updated_at.isoformat(),
     }
 

@@ -187,6 +187,16 @@ def is_analytical_history_question(text_value: str) -> bool:
     )
 
 
+def is_temporal_query_intent(text_value: str) -> bool:
+    lower = text_value.lower().strip()
+    return (
+        "?" in text_value
+        or lower.startswith(("what", "when", "how", "did", "was", "were", "compare", "summarize", "show", "tell me", "review", "analyze", "give me"))
+        or "what changed" in lower
+        or "between " in lower
+    )
+
+
 def classify_event_type(text_value: str) -> str:
     lower = text_value.lower()
     if any(word in lower for word in ("ate", "meal", "breakfast", "lunch", "dinner", "coffee", "snack")):
@@ -638,6 +648,15 @@ def default_persona_profile() -> dict[str, Any]:
     }
 
 
+def persona_summary_line(items: list[dict[str, Any]], empty_value: str, *, limit: int = 3) -> str:
+    picked: list[str] = []
+    for item in items[:limit]:
+        content = str(item.get("content") or "").strip()
+        if content and content not in picked:
+            picked.append(content)
+    return " ".join(picked) if picked else empty_value
+
+
 def ensure_persona(db: Session) -> PersonaProfile:
     persona = db.get(PersonaProfile, 1)
     if persona:
@@ -1081,6 +1100,167 @@ def serialize_reflection_summary(summary: ReflectionSummary) -> dict[str, Any]:
     }
 
 
+def current_day_signal_data(db: Session, *, now: datetime | None = None) -> dict[str, Any]:
+    now = db_utc(now) or datetime.now(timezone.utc)
+    start = start_of_day(now)
+    end = end_of_day(now)
+    recent_start = now - timedelta(days=3)
+    entries = (
+        db.query(RawEntry)
+        .filter(RawEntry.occurred_at >= start, RawEntry.occurred_at < end)
+        .order_by(desc(RawEntry.occurred_at))
+        .limit(24)
+        .all()
+    )
+    events = (
+        db.query(ExtractedEvent)
+        .filter(ExtractedEvent.occurred_at >= start, ExtractedEvent.occurred_at < end)
+        .order_by(desc(ExtractedEvent.occurred_at))
+        .limit(30)
+        .all()
+    )
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.created_at >= start, ChatMessage.created_at < end)
+        .order_by(desc(ChatMessage.created_at))
+        .limit(20)
+        .all()
+    )
+    recent_messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.created_at >= recent_start, ChatMessage.created_at < now, ChatMessage.role == "user")
+        .order_by(desc(ChatMessage.created_at))
+        .limit(12)
+        .all()
+    )
+    upcoming_items = (
+        db.query(TimeItem)
+        .filter(TimeItem.status.in_(("open", "snoozed")))
+        .filter(
+            or_(
+                (TimeItem.due_at >= now) & (TimeItem.due_at < end),
+                (TimeItem.starts_at >= now) & (TimeItem.starts_at < end),
+            )
+        )
+        .order_by(TimeItem.starts_at.is_(None), TimeItem.starts_at, TimeItem.due_at.is_(None), TimeItem.due_at, desc(TimeItem.priority))
+        .limit(8)
+        .all()
+    )
+    urgent_items = urgent_items_for_overview(db)
+    return {
+        "now": now,
+        "start": start,
+        "end": end,
+        "entries": entries,
+        "events": events,
+        "messages": messages,
+        "recent_messages": recent_messages,
+        "upcoming_items": upcoming_items,
+        "urgent_items": urgent_items,
+    }
+
+
+def current_day_evidence_payload(data: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for entry in data["entries"][:3]:
+        evidence.append({"object_type": "raw_entry", "object_id": entry.id})
+    for event in data["events"][:4]:
+        evidence.append({"object_type": "event", "object_id": event.id})
+    for message in data["messages"][:3]:
+        evidence.append({"object_type": "chat_message", "object_id": message.id})
+    for item in data["upcoming_items"][:3]:
+        evidence.append({"object_type": "time_item", "object_id": item.id})
+    return evidence
+
+
+def build_current_day_brief(db: Session, summaries: list[ReflectionSummary], *, now: datetime | None = None) -> dict[str, Any]:
+    data = current_day_signal_data(db, now=now)
+    now = data["now"]
+    current_day = now.astimezone(local_tz()).date().isoformat()
+    entry_lines = [entry.text.strip()[:180] for entry in data["entries"][:3] if entry.text.strip()]
+    event_lines = [event.summary.strip()[:180] for event in data["events"][:4] if event.summary.strip()]
+    message_lines = [message.content.strip()[:180] for message in data["messages"][:4] if message.role == "user" and message.content.strip()]
+    recent_lines = [message.content.strip()[:180] for message in data["recent_messages"] if message.content.strip()]
+    upcoming_titles = [item.title for item in data["upcoming_items"][:4]]
+    urgent_card_items = [time_item_to_card_item(item) for item in data["urgent_items"]]
+
+    recent_relevant_signals: list[str] = []
+    for line in event_lines[:2]:
+        recent_relevant_signals.append(line)
+    for line in message_lines[:2]:
+        if line not in recent_relevant_signals:
+            recent_relevant_signals.append(line)
+    for line in recent_lines[:2]:
+        lower = line.lower()
+        if any(term in lower for term in ("today", "tomorrow", "later", "meeting", "remind", "need to", "plan", "focus")) and line not in recent_relevant_signals:
+            recent_relevant_signals.append(line)
+    recent_relevant_signals = recent_relevant_signals[:4]
+
+    today_focus: list[str] = []
+    if upcoming_titles:
+        today_focus.append(f"Upcoming today: {', '.join(upcoming_titles[:3])}.")
+    if event_lines:
+        today_focus.append(f"Already captured: {event_lines[0]}")
+    if message_lines:
+        today_focus.append(f"Chat focus: {message_lines[0]}")
+    if not today_focus and summaries:
+        carry = normalize_string_list((summaries[0].payload or {}).get("carry_forward_points"))
+        if carry:
+            today_focus.append(f"Carry-over to watch: {carry[0]}")
+
+    tips: list[str] = []
+    if upcoming_titles:
+        tips.append("Use the next event or reminder as the anchor for your next block.")
+    if data["urgent_items"]:
+        tips.append("Close one open loop early so the rest of the day has less drag.")
+    if recent_relevant_signals:
+        tips.append("Keep feeding short concrete logs so the brief can sharpen during the day.")
+    if not tips:
+        tips.append("Begynn å chatte for å gi meg noe å analysere!")
+
+    signal_count = len(data["entries"]) + len(data["events"]) + len(message_lines) + len(upcoming_titles) + len(recent_relevant_signals)
+    if signal_count == 0:
+        message = "Begynn å chatte for å gi meg noe å analysere!"
+        confidence = "empty"
+        today_focus = []
+        recent_relevant_signals = []
+        tips = []
+    else:
+        message_parts: list[str] = []
+        if upcoming_titles:
+            message_parts.append(f"{len(upcoming_titles)} upcoming item{'s' if len(upcoming_titles) != 1 else ''} on deck.")
+        if event_lines:
+            message_parts.append(f"Latest signal: {event_lines[0]}")
+        elif entry_lines:
+            message_parts.append(f"Latest log: {entry_lines[0]}")
+        if message_lines:
+            message_parts.append(f"Today's chat context: {message_lines[0]}")
+        elif recent_relevant_signals:
+            message_parts.append(f"Recent context still relevant: {recent_relevant_signals[0]}")
+        message = " ".join(message_parts[:3]) or "Begynn å chatte for å gi meg noe å analysere!"
+        confidence = "high" if signal_count >= 6 else "medium" if signal_count >= 3 else "low"
+
+    return {
+        "headline": f"Dagens brief for {current_day}",
+        "message": message,
+        "today_focus": today_focus[:4],
+        "upcoming_items": [time_item_to_card_item(item) for item in data["upcoming_items"]],
+        "recent_relevant_signals": recent_relevant_signals,
+        "tips": tips[:3],
+        "confidence": confidence,
+        "metrics": {
+            "today_logs": len(data["entries"]),
+            "today_events": len(data["events"]),
+            "today_messages": len(message_lines),
+            "upcoming_items": len(data["upcoming_items"]),
+            "urgent_items": len(urgent_card_items),
+        },
+        "evidence": current_day_evidence_payload(data),
+        "generated_for_day": current_day,
+        "generated_at": now.isoformat(),
+    }
+
+
 def urgent_items_for_overview(db: Session) -> list[TimeItem]:
     now = datetime.now(timezone.utc)
     today_start = start_of_day(now)
@@ -1112,33 +1292,26 @@ def urgent_items_for_overview(db: Session) -> list[TimeItem]:
 
 def build_overview_card_payload(db: Session, summaries: list[ReflectionSummary]) -> dict[str, Any]:
     milestone_dicts = [serialize_reflection_summary(summary) for summary in summaries]
+    brief = build_current_day_brief(db, summaries)
     urgent_items = [time_item_to_card_item(item) for item in urgent_items_for_overview(db)]
-    primary = milestone_dicts[0] if milestone_dicts else None
-    card_title = f"Daily feedback for {primary['anchor_date']}" if primary else "Daily feedback"
-    risk_line = primary["risks"][0] if primary and primary.get("risks") else "No urgent risk surfaced yet."
-    message_parts = []
-    if primary:
-        message_parts.append(primary["headline"])
-    if milestone_dicts:
-        message_parts.append(f"Tracked across {len(milestone_dicts)} rolling windows.")
-    if urgent_items:
-        message_parts.append(f"{len(urgent_items)} urgent or still-open items are attached below.")
-    message_parts.append(risk_line)
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "card_title": card_title,
-        "card_message": " ".join(message_parts),
+        "generated_at": brief["generated_at"],
+        "brief_title": brief["headline"],
+        "brief_message": brief["message"],
+        "brief_payload": brief,
         "milestones": milestone_dicts,
         "urgent_items": urgent_items,
         "metrics": {
+            "brief_confidence": brief["confidence"],
             "milestones": len(milestone_dicts),
             "urgent_items": len(urgent_items),
         },
         "sections": [
+            {"title": "Brief", "items": [brief]},
             {"title": "Milestones", "items": milestone_dicts},
             {"title": "Urgent items", "items": urgent_items},
         ],
-        "evidence": [item for summary in milestone_dicts for item in summary.get("evidence", [])[:2]],
+        "evidence": [*brief["evidence"], *[item for summary in milestone_dicts for item in summary.get("evidence", [])[:1]]],
     }
 
 
@@ -1183,11 +1356,14 @@ def refresh_overview_card(db: Session, *, anchor_date: date | None = None) -> Da
     card = {
         "mode": "overview",
         "card_type": "reflection_overview",
-        "title": payload["card_title"],
-        "summary": payload["card_message"],
+        "title": payload["brief_title"],
+        "summary": payload["brief_message"],
         "priority": 95,
         "metrics": payload["metrics"],
         "sections": payload["sections"],
+        "brief_title": payload["brief_title"],
+        "brief_message": payload["brief_message"],
+        "brief_payload": payload["brief_payload"],
         "milestones": payload["milestones"],
         "urgent_items": payload["urgent_items"],
         "generated_at": payload["generated_at"],
@@ -1232,6 +1408,9 @@ def card_to_dict(card: DashboardCard) -> dict[str, Any]:
         "title": card.title,
         "summary": card.summary,
         "priority": card.priority,
+        "brief_title": payload.get("brief_title") or card.title,
+        "brief_message": payload.get("brief_message") or card.summary,
+        "brief_payload": payload.get("brief_payload", {}),
         "metrics": payload.get("metrics", {}),
         "sections": payload.get("sections", []),
         "milestones": payload.get("milestones", []),
@@ -1263,19 +1442,8 @@ def persona_group_name(kind: str) -> str:
 def persona_stable_profile(persona: PersonaProfile) -> dict[str, Any]:
     profile = {**default_persona_profile(), **(persona.profile or {})}
     return {
-        "birth_year": persona.birth_year,
         "gender": persona.gender,
-        "locale": persona.locale,
-        "timezone": persona.timezone,
         "name": profile["name"],
-        "life_stage": profile["life_stage"],
-        "personality_summary": profile["personality_summary"],
-        "wellbeing_baseline": profile["wellbeing_baseline"],
-        "focus_areas": profile["focus_areas"],
-        "values": profile["values"],
-        "preferences": profile["preferences"],
-        "constraints": profile["constraints"],
-        "goals": profile["goals"],
     }
 
 
@@ -1307,6 +1475,35 @@ def grouped_persona_memories(db: Session) -> dict[str, list[dict[str, Any]]]:
             }
         )
     return groups
+
+
+def inferred_persona_profile_summary(db: Session, persona: PersonaProfile | None = None) -> dict[str, str]:
+    persona = persona or ensure_persona(db)
+    groups = grouped_persona_memories(db)
+    profile = {**default_persona_profile(), **(persona.profile or {})}
+    name = profile.get("name") or "you"
+    gender = persona.gender or "unspecified"
+
+    identity_parts = [f"LifeOS knows {name} as a self-building profile."]
+    if gender and gender != "unspecified":
+        identity_parts.append(f"Gender currently set to {gender}.")
+    identity_parts.append(persona_summary_line(groups["traits"], "There are not enough durable trait signals yet."))
+
+    wellbeing = persona_summary_line(
+        groups["wellbeing_signals"] + groups["health_patterns"],
+        "No stable wellbeing baseline has been inferred yet.",
+    )
+    focus = persona_summary_line(groups["goals"], "Goals are still emerging from your logs and chats.")
+    prefs = persona_summary_line(
+        groups["preferences"] + groups["work_style"],
+        "Preferences and work style will appear here as you keep chatting.",
+    )
+    return {
+        "identity": " ".join(identity_parts),
+        "wellbeing_baseline": wellbeing,
+        "focus_and_goals": focus,
+        "preferences_and_work_style": prefs,
+    }
 
 
 def run_job(db: Session, job_name: str) -> AgentRun:
@@ -1451,17 +1648,17 @@ def context_counts(context: HistoricalContext) -> dict[str, int]:
 def render_historical_timeline(context: HistoricalContext, timezone_name: str) -> str:
     timeline: list[tuple[datetime, str]] = []
     for entry in context.logs:
-        timeline.append((entry.occurred_at, f"{format_local_timestamp(entry.occurred_at, timezone_name)} [log] {entry.text}"))
+        timeline.append((db_utc(entry.occurred_at) or entry.occurred_at, f"{format_local_timestamp(entry.occurred_at, timezone_name)} [log] {entry.text}"))
     for event in context.events:
-        timeline.append((event.occurred_at, f"{format_local_timestamp(event.occurred_at, timezone_name)} [{event.event_type}] {event.summary}"))
+        timeline.append((db_utc(event.occurred_at) or event.occurred_at, f"{format_local_timestamp(event.occurred_at, timezone_name)} [{event.event_type}] {event.summary}"))
     for item in context.time_items:
         when = item.due_at or item.starts_at
         if when:
-            timeline.append((when, f"{format_local_timestamp(when, timezone_name)} [{item.kind}] {item.title}"))
+            timeline.append((db_utc(when) or when, f"{format_local_timestamp(when, timezone_name)} [{item.kind}] {item.title}"))
     for message in context.chat_messages:
         timeline.append(
             (
-                message.created_at,
+                db_utc(message.created_at) or message.created_at,
                 f"{format_local_timestamp(message.created_at, timezone_name)} [chat:{message.role}] {message.content[:200]}",
             )
         )
@@ -1588,8 +1785,8 @@ def answer_historical_analysis(
 def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
     persona = ensure_persona(db)
     timezone_name = persona.timezone or settings.default_timezone
-    comparison_windows = parse_comparison_time_windows(message, timezone_name=timezone_name)
-    primary_window = parse_time_window(message, timezone_name=timezone_name)
+    comparison_windows = parse_comparison_time_windows(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
+    primary_window = parse_time_window(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
     if comparison_windows:
         left_context = historical_context(db, comparison_windows[0], include_memories=is_analytical_history_question(message))
         right_context = historical_context(db, comparison_windows[1], include_memories=is_analytical_history_question(message))

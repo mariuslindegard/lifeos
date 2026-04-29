@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 import re
 from typing import Any
 
@@ -29,6 +30,28 @@ def get_llm() -> OllamaClient:
     return OllamaClient()
 
 
+def wait_for_ollama_ready(timeout_seconds: int | None = None) -> None:
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else settings.ollama_startup_timeout_seconds
+    deadline = time.time() + max(1, timeout_seconds)
+    client = ollama.Client(host=settings.ollama_base_url)
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            client.list()
+            client.show(settings.ollama_model)
+            client.show(settings.ollama_embed_model)
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+    detail = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
+    raise RuntimeError(
+        "Ollama is required in production but is not ready. "
+        f"base_url={settings.ollama_base_url} model={settings.ollama_model} "
+        f"embed_model={settings.ollama_embed_model} detail={detail}"
+    )
+
+
 def fallback_embedding(text: str, dimensions: int = 64) -> list[float]:
     """Deterministic lexical embedding used when Ollama is unavailable."""
     vector = [0.0] * dimensions
@@ -54,4 +77,3 @@ def safe_json_object(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
-

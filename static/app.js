@@ -170,6 +170,23 @@ function renderMilestone(summary) {
   return article;
 }
 
+function renderBriefList(title, items) {
+  if (!items?.length) return null;
+  return renderStringList(title, items);
+}
+
+function renderPersonaSummaryCard(title, text) {
+  const section = document.createElement("section");
+  section.className = "persona-group persona-summary-card";
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  const body = document.createElement("p");
+  body.className = "reflection-message";
+  body.textContent = text || "No signal yet.";
+  section.append(heading, body);
+  return section;
+}
+
 function renderOverview(data) {
   state.overview = data;
   const container = $("#overviewContent");
@@ -182,14 +199,39 @@ function renderOverview(data) {
   const hero = document.createElement("header");
   hero.className = "reflection-hero";
   const title = document.createElement("h2");
-  title.textContent = data.card_title || "Daily feedback";
+  title.textContent = data.brief_title || "Dagens brief";
   const message = document.createElement("p");
   message.className = "reflection-message";
-  message.textContent = data.card_message || "No feedback generated yet.";
+  message.textContent = data.brief_message || "Begynn å chatte for å gi meg noe å analysere!";
   const meta = document.createElement("p");
   meta.className = "subtle";
   meta.textContent = data.generated_at ? `Generated ${formatTime(data.generated_at)}` : "";
-  hero.append(title, message, meta);
+  hero.append(title, message);
+
+  const brief = data.brief_payload || {};
+  const metrics = document.createElement("div");
+  metrics.className = "metrics-row";
+  for (const [key, value] of Object.entries(brief.metrics || {}).slice(0, 5)) {
+    metrics.appendChild(metricPill(titleize(key), value));
+  }
+  if (metrics.childNodes.length) {
+    hero.appendChild(metrics);
+  }
+
+  const briefGrid = document.createElement("div");
+  briefGrid.className = "summary-grid";
+  for (const node of [
+    renderBriefList("Today Focus", brief.today_focus),
+    renderBriefList("Recent Signals", brief.recent_relevant_signals),
+    renderBriefList("Tips", brief.tips),
+  ]) {
+    if (node) briefGrid.appendChild(node);
+  }
+  if (briefGrid.childNodes.length) {
+    hero.appendChild(briefGrid);
+  }
+
+  hero.appendChild(meta);
   surface.appendChild(hero);
 
   const urgentSection = document.createElement("section");
@@ -215,35 +257,37 @@ function renderOverview(data) {
   }
   surface.appendChild(urgentSection);
 
-  const milestoneSection = document.createElement("section");
-  milestoneSection.className = "surface-section";
-  const milestoneHead = document.createElement("div");
-  milestoneHead.className = "section-head";
+  const milestoneSection = document.createElement("details");
+  milestoneSection.className = "surface-section history-section";
+  const milestoneHead = document.createElement("summary");
+  milestoneHead.className = "section-head history-toggle";
   const milestoneTitle = document.createElement("h3");
-  milestoneTitle.textContent = "Rolling Milestones";
-  milestoneHead.appendChild(milestoneTitle);
+  milestoneTitle.textContent = "Earlier Reflections";
+  const milestoneMeta = document.createElement("p");
+  milestoneMeta.className = "subtle";
+  milestoneMeta.textContent = data.milestones?.length ? `${data.milestones.length} rolling windows` : "No history yet";
+  milestoneHead.append(milestoneTitle, milestoneMeta);
   milestoneSection.appendChild(milestoneHead);
 
+  const milestoneBody = document.createElement("div");
+  milestoneBody.className = "history-stack";
   if (data.milestones?.length) {
     const stack = document.createElement("div");
     stack.className = "milestone-stack";
     for (const summary of data.milestones) {
       stack.appendChild(renderMilestone(summary));
     }
-    milestoneSection.appendChild(stack);
+    milestoneBody.appendChild(stack);
   } else {
     const p = document.createElement("p");
     p.className = "subtle";
     p.textContent = "No milestone summaries yet.";
-    milestoneSection.appendChild(p);
+    milestoneBody.appendChild(p);
   }
+  milestoneSection.appendChild(milestoneBody);
   surface.appendChild(milestoneSection);
 
   container.appendChild(surface);
-}
-
-function listFieldValue(value) {
-  return Array.isArray(value) ? value.join(", ") : "";
 }
 
 function renderPersonaGroup(title, items) {
@@ -301,11 +345,7 @@ function renderPersona(data) {
   form.className = "persona-form";
   const fields = [
     ["name", "Name", "text"],
-    ["life_stage", "Life stage", "text"],
-    ["birth_year", "Birth year", "number"],
     ["gender", "Gender", "text"],
-    ["locale", "Locale", "text"],
-    ["timezone", "Timezone", "text"],
   ];
   for (const [key, labelText, type] of fields) {
     const label = document.createElement("label");
@@ -316,43 +356,6 @@ function renderPersona(data) {
     input.name = key;
     input.type = type;
     input.value = profile[key] ?? "";
-    label.append(span, input);
-    form.appendChild(label);
-  }
-
-  const textAreas = [
-    ["personality_summary", "Personality summary"],
-    ["wellbeing_baseline", "Wellbeing baseline"],
-  ];
-  for (const [key, labelText] of textAreas) {
-    const label = document.createElement("label");
-    label.className = "field full";
-    const span = document.createElement("span");
-    span.textContent = labelText;
-    const textarea = document.createElement("textarea");
-    textarea.name = key;
-    textarea.rows = 3;
-    textarea.value = profile[key] ?? "";
-    label.append(span, textarea);
-    form.appendChild(label);
-  }
-
-  const listFields = [
-    ["focus_areas", "Focus areas"],
-    ["values", "Values"],
-    ["preferences", "Preferences"],
-    ["constraints", "Constraints"],
-    ["goals", "Goals"],
-  ];
-  for (const [key, labelText] of listFields) {
-    const label = document.createElement("label");
-    label.className = "field full";
-    const span = document.createElement("span");
-    span.textContent = `${labelText} (comma separated)`;
-    const input = document.createElement("input");
-    input.name = key;
-    input.type = "text";
-    input.value = listFieldValue(profile[key]);
     label.append(span, input);
     form.appendChild(label);
   }
@@ -375,9 +378,16 @@ function renderPersona(data) {
   const inferredHead = document.createElement("div");
   inferredHead.className = "section-head";
   const inferredTitle = document.createElement("h2");
-  inferredTitle.textContent = "Inferred Signals";
+  inferredTitle.textContent = "How LifeOS Sees You";
   inferredHead.appendChild(inferredTitle);
   inferredCard.appendChild(inferredHead);
+  const summary = data.inferred_profile_summary || {};
+  inferredCard.append(
+    renderPersonaSummaryCard("How LifeOS sees you", summary.identity),
+    renderPersonaSummaryCard("Current wellbeing baseline", summary.wellbeing_baseline),
+    renderPersonaSummaryCard("Focus and goals", summary.focus_and_goals),
+    renderPersonaSummaryCard("Preferences and work style", summary.preferences_and_work_style),
+  );
   const groups = data.inferred_groups || {};
   for (const key of ["traits", "preferences", "goals", "health_patterns", "work_style", "wellbeing_signals", "other"]) {
     inferredCard.appendChild(renderPersonaGroup(titleize(key), groups[key]));
@@ -574,19 +584,9 @@ $("#personaContent").addEventListener("submit", async (event) => {
   if (event.target.id !== "personaForm") return;
   event.preventDefault();
   const form = new FormData(event.target);
-  const listFields = new Set(["focus_areas", "values", "preferences", "constraints", "goals"]);
   const payload = {};
   for (const [key, value] of form.entries()) {
-    if (listFields.has(key)) {
-      payload[key] = String(value)
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-    } else if (key === "birth_year") {
-      payload[key] = value ? Number(value) : null;
-    } else {
-      payload[key] = String(value).trim();
-    }
+    payload[key] = String(value).trim();
   }
   const status = $("#personaStatus");
   status.textContent = "Saving...";

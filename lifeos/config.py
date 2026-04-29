@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
 
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "gemma4:4b"
+    ollama_model: str = "gemma4:e4b"
     ollama_embed_model: str = "nomic-embed-text"
+    ollama_startup_timeout_seconds: int = 1800
 
     scheduler_enabled: bool = True
     default_timezone: str = "Europe/Oslo"

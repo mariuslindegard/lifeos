@@ -246,9 +246,28 @@ h3 {
   gap: 18px;
 }
 
+.history-section {
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
 .section-head {
   justify-content: space-between;
   gap: 12px;
+}
+
+.history-toggle {
+  cursor: pointer;
+  list-style: none;
+}
+
+.history-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.history-stack {
+  display: grid;
+  gap: 18px;
 }
 
 .urgent-list,
@@ -399,6 +418,11 @@ h3 {
   gap: 12px;
   padding-top: 16px;
   border-top: 1px solid var(--line);
+}
+
+.persona-summary-card {
+  padding-top: 0;
+  border-top: 0;
 }
 
 .memory-item {

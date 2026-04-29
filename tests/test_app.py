@@ -15,8 +15,9 @@ from sqlalchemy import inspect
 from lifeos.agent import add_memory, latest_completed_local_day
 from lifeos.db import SessionLocal, engine
 from lifeos.main import app
-from lifeos.models import AgentRun, ChatMessage, ChatSession, Memory, ReflectionSummary, TimeItem
+from lifeos.models import AgentRun, ChatMessage, ChatSession, DashboardCard, ExtractedEvent, Memory, RawEntry, ReflectionSummary, TimeItem
 from lifeos.rag import parse_time_window
+from lifeos.scheduler import scheduler, start_scheduler, stop_scheduler
 
 OSLO = ZoneInfo("Europe/Oslo")
 
@@ -36,6 +37,16 @@ def latest_anchor_noon() -> datetime:
     return datetime(anchor.year, anchor.month, anchor.day, 12, 0, tzinfo=timezone.utc)
 
 
+def clear_runtime_rows() -> None:
+    db = SessionLocal()
+    try:
+        for model in (AgentRun, ChatMessage, ChatSession, DashboardCard, ExtractedEvent, RawEntry, TimeItem, ReflectionSummary, Memory):
+            db.query(model).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_auth_required_and_overview_endpoint() -> None:
     with TestClient(app) as client:
         assert client.get("/api/overview").status_code == 401
@@ -43,7 +54,8 @@ def test_auth_required_and_overview_endpoint() -> None:
         response = client.get("/api/overview")
         assert response.status_code == 200
         data = response.json()
-        assert data["card_title"]
+        assert data["brief_title"]
+        assert data["brief_message"] == "Begynn å chatte for å gi meg noe å analysere!"
         assert [item["period_key"] for item in data["milestones"]] == [
             "yesterday",
             "past_7_days",
@@ -178,20 +190,17 @@ def test_persona_patch_updates_stable_profile_without_mutating_memories(monkeypa
         response = client.patch(
             "/api/persona",
             json={
-                "birth_year": 1990,
                 "gender": "male",
-                "locale": "en",
-                "timezone": "Europe/Oslo",
                 "name": "Marius",
                 "focus_areas": ["health", "work"],
-                "goals": ["Build consistent routines"],
             },
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["stable_profile"]["birth_year"] == 1990
         assert data["stable_profile"]["name"] == "Marius"
-        assert data["stable_profile"]["goals"] == ["Build consistent routines"]
+        assert data["stable_profile"]["gender"] == "male"
+        assert "focus_areas" not in data["stable_profile"]
+        assert data["inferred_profile_summary"]["identity"]
 
         db = SessionLocal()
         try:
@@ -216,8 +225,10 @@ def test_direct_persona_inference_still_works_from_chat_and_logs(monkeypatch) ->
         )
         persona = client.get("/api/persona")
         assert persona.status_code == 200
-        groups = persona.json()["inferred_groups"]
+        payload = persona.json()
+        groups = payload["inferred_groups"]
         assert groups["preferences"] or groups["goals"] or groups["traits"]
+        assert payload["inferred_profile_summary"]["preferences_and_work_style"]
 
 
 def test_chat_session_rolls_after_six_hours(monkeypatch) -> None:
@@ -261,6 +272,45 @@ def test_removed_mode_jobs_return_404_and_core_jobs_still_work(monkeypatch) -> N
             assert len(summaries) == 5
         finally:
             db.close()
+
+
+def test_overview_returns_live_brief_when_today_has_signal(monkeypatch) -> None:
+    monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.5, 0.1, 0.4])
+    clear_runtime_rows()
+
+    with TestClient(app) as client:
+        login(client)
+        client.post("/api/chat", json={"message": "Need to prepare for a client meeting and review notes today."})
+        response = client.get("/api/overview")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["brief_title"].startswith("Dagens brief")
+        assert data["brief_message"] != "Begynn å chatte for å gi meg noe å analysere!"
+        assert "Tracked across" not in data["brief_message"]
+
+
+def test_overview_empty_state_uses_exact_norwegian_message() -> None:
+    clear_runtime_rows()
+    with TestClient(app) as client:
+        login(client)
+        response = client.get("/api/overview")
+        assert response.status_code == 200
+        assert response.json()["brief_message"] == "Begynn å chatte for å gi meg noe å analysere!"
+
+
+def test_overview_refresh_scheduler_runs_every_two_hours(monkeypatch) -> None:
+    scheduler.remove_all_jobs()
+    if scheduler.running:
+        stop_scheduler()
+    monkeypatch.setattr("lifeos.scheduler.settings.scheduler_enabled", True)
+    start_scheduler()
+    try:
+        job = scheduler.get_job("overview_refresh")
+        assert job is not None
+        assert getattr(job.trigger.interval, "total_seconds")() == 7200
+    finally:
+        stop_scheduler()
+        scheduler.remove_all_jobs()
 
 
 def test_chat_history_time_item_actions_and_message_storage_still_work(monkeypatch) -> None:
@@ -341,7 +391,10 @@ def test_frontend_markup_and_assets_match_new_shell() -> None:
     assert 'id="cardsGrid"' not in html
     assert "function renderOverview" in js
     assert "function renderPersona" in js
+    assert "Earlier Reflections" in js
+    assert "Begynn å chatte for å gi meg noe å analysere!" in js
     assert "reflection-surface" in css
     assert "persona-layout" in css
+    assert "history-section" in css
     assert "brief-grid" not in css
-    assert 'CACHE_NAME = "lifeos-v7"' in sw
+    assert 'CACHE_NAME = "lifeos-v8"' in sw

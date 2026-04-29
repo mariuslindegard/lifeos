@@ -19,7 +19,7 @@ def start_scheduler() -> None:
     if not settings.scheduler_enabled or scheduler.running:
         return
     scheduler.add_job(lambda: _run("ingest"), "interval", minutes=5, id="ingest", replace_existing=True)
-    scheduler.add_job(lambda: _run("overview_refresh"), "interval", hours=1, id="overview_refresh", replace_existing=True)
+    scheduler.add_job(lambda: _run("overview_refresh"), "interval", hours=2, id="overview_refresh", replace_existing=True)
     scheduler.add_job(lambda: _run("summary_rollup"), "cron", hour=3, minute=15, id="summary_rollup", replace_existing=True)
     scheduler.start()
 

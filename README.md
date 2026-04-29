@@ -17,6 +17,8 @@ To run Ollama inside Compose and pull the default chat and embedding models auto
 docker compose --profile ollama up --build
 ```
 
+The default chat model is `gemma4:e4b` and the default embedding model is `nomic-embed-text`.
+
 If Ollama runs on the Ubuntu host instead, set `OLLAMA_BASE_URL=http://host.docker.internal:11434` in `.env`.
 
 ## Local Development
@@ -43,7 +45,7 @@ pytest
 - `dashboard_cards` stores the active Overview reflection card payload.
 - `daily_reports` stores historical agent reports when generated.
 - `reflection_summaries` stores rolling milestone summaries for yesterday, 7d, 30d, 6m, and 1y windows.
-- `persona_profile` stores a few stable fields plus flexible JSON profile data.
+- `persona_profile` stores only the small user-managed stable profile surface plus flexible internal profile data.
 - `memories` stores long-term facts with confidence and evidence.
 - `embeddings` stores local vectors as JSON for semantic recall.
 - SQLite FTS5 powers exact text/date retrieval.
@@ -55,8 +57,8 @@ The app is intentionally useful without a model running: logging, grounded histo
 
 The LLM never writes frontend HTML. Agent jobs generate structured card JSON that the PWA renders through fixed components:
 
-- Overview: one reflection surface composed of rolling milestone summaries plus urgent items.
-- Persona: editable stable profile fields plus inferred memories grouped into traits, preferences, goals, health patterns, work style, and wellbeing signals.
+- Overview: one live current-day brief fed by today’s logs, chats, and upcoming items, with rolling milestone summaries tucked into history below it.
+- Persona: only `name` and `gender` are editable; the rest of the profile is inferred and rendered as read-only summaries plus grouped memories.
 - Chat: natural-language logging, reminders, and grounded historical analysis over data already stored in the database.
 
 Useful local examples:
