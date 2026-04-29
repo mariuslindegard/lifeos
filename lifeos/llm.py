@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import time
 import re
 from typing import Any
@@ -7,6 +8,9 @@ from typing import Any
 import ollama
 
 from lifeos.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
@@ -35,14 +39,31 @@ def wait_for_ollama_ready(timeout_seconds: int | None = None) -> None:
     deadline = time.time() + max(1, timeout_seconds)
     client = ollama.Client(host=settings.ollama_base_url)
     last_error: Exception | None = None
+    next_log_at = 0.0
     while time.time() < deadline:
         try:
             client.list()
             client.show(settings.ollama_model)
             client.show(settings.ollama_embed_model)
+            logger.info(
+                "Ollama ready at %s with chat model=%s embed model=%s",
+                settings.ollama_base_url,
+                settings.ollama_model,
+                settings.ollama_embed_model,
+            )
             return
         except Exception as exc:
             last_error = exc
+            now = time.time()
+            if now >= next_log_at:
+                logger.warning(
+                    "Waiting for Ollama at %s with chat model=%s embed model=%s: %s",
+                    settings.ollama_base_url,
+                    settings.ollama_model,
+                    settings.ollama_embed_model,
+                    exc,
+                )
+                next_log_at = now + 10
             time.sleep(2)
     detail = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
     raise RuntimeError(
