@@ -4,7 +4,6 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, or_, text
-from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 
 from lifeos.config import settings
@@ -13,24 +12,41 @@ from lifeos.models import (
     AgentRun,
     ChatMessage,
     ChatSession,
-    DailyReport,
     DashboardCard,
+    DailyReport,
     ExtractedEvent,
     Memory,
     PersonaProfile,
     RawEntry,
-    Recommendation,
+    ReflectionSummary,
     TimeItem,
 )
-from lifeos.rag import events_between, parse_date_range, recent_context, semantic_search, upsert_embedding
+from lifeos.rag import (
+    HistoricalContext,
+    ResolvedTimeWindow,
+    historical_context,
+    parse_comparison_time_windows,
+    parse_time_window,
+    recent_context,
+    semantic_search,
+    upsert_embedding,
+)
 
 EVENT_TYPES = ("meal", "exercise", "sleep", "mood", "symptom", "work", "activity", "note")
 TIME_ITEM_TYPES = ("task", "reminder", "deadline", "event", "time_block", "open_loop")
-CARD_MODES = ("execution", "analysis", "journal", "persona")
-CARD_ORDER = ("execution", "analysis", "journal", "persona")
-ANALYSIS_MODES = ("daily_execution", "self_analysis", "life_journal", "persona_refresh")
+CARD_MODES = ("overview", "execution", "analysis", "journal", "persona")
+CARD_ORDER = ("overview",)
 ANALYSIS_VERSION = "v1"
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
+
+REFLECTION_PERIODS = (
+    ("yesterday", "Previous day", 1),
+    ("past_7_days", "Past 7 days", 7),
+    ("past_30_days", "Past 30 days", 30),
+    ("past_6_months", "Past 6 months", 183),
+    ("past_1_year", "Past 1 year", 365),
+)
+REFLECTION_LABELS = {key: label for key, label, _days in REFLECTION_PERIODS}
 
 MONTHS = {
     "jan": 1,
@@ -69,8 +85,8 @@ WEEKDAYS = {
 }
 
 
-def local_tz() -> ZoneInfo:
-    return ZoneInfo(settings.default_timezone)
+def local_tz(timezone_name: str | None = None) -> ZoneInfo:
+    return ZoneInfo(timezone_name or settings.default_timezone)
 
 
 def as_utc(value: datetime) -> datetime:
@@ -101,6 +117,24 @@ def local_date(value: datetime | None) -> date | None:
     return value.astimezone(local_tz()).date() if value else None
 
 
+def local_day_bounds(day_value: date) -> tuple[datetime, datetime]:
+    start = datetime.combine(day_value, time.min, tzinfo=local_tz())
+    end = start + timedelta(days=1)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def latest_completed_local_day(now: datetime | None = None) -> date:
+    now = db_utc(now) or datetime.now(timezone.utc)
+    return now.astimezone(local_tz()).date() - timedelta(days=1)
+
+
+def reflection_window(anchor_date: date, days: int) -> tuple[datetime, datetime]:
+    start_date = anchor_date - timedelta(days=days - 1)
+    start, _mid = local_day_bounds(start_date)
+    _start_anchor, end = local_day_bounds(anchor_date)
+    return start, end
+
+
 def is_session_active(session: ChatSession, now: datetime | None = None) -> bool:
     now = now or datetime.now(timezone.utc)
     last_message_at = db_utc(session.last_message_at or session.created_at)
@@ -109,51 +143,6 @@ def is_session_active(session: ChatSession, now: datetime | None = None) -> bool
     if now - last_message_at >= timedelta(hours=6):
         return False
     return local_date(last_message_at) == local_date(now)
-
-
-def is_execution_relevant(text_value: str) -> bool:
-    lower = text_value.lower()
-    return bool(
-        classify_time_item(text_value)
-        or any(
-            word in lower
-            for word in (
-                "selling",
-                "work",
-                "worked",
-                "plan",
-                "goal",
-                "deadline",
-                "blocked",
-                "could've gone better",
-                "could have gone better",
-            )
-        )
-    )
-
-
-def is_self_analysis_relevant(text_value: str) -> bool:
-    lower = text_value.lower()
-    return any(
-        word in lower
-        for word in (
-            "ate",
-            "food",
-            "meal",
-            "energized",
-            "energy",
-            "tired",
-            "focus",
-            "mood",
-            "self-esteem",
-            "confidence",
-            "sleep",
-            "felt",
-            "crash",
-            "anxious",
-            "stress",
-        )
-    )
 
 
 def is_persona_relevant(text_value: str) -> bool:
@@ -176,67 +165,26 @@ def is_persona_relevant(text_value: str) -> bool:
     )
 
 
-def applicable_analysis_modes(message: ChatMessage) -> list[str]:
-    if message.role == "assistant":
-        return ["life_journal"]
-    modes = ["life_journal"]
-    if is_execution_relevant(message.content):
-        modes.append("daily_execution")
-    if is_self_analysis_relevant(message.content):
-        modes.append("self_analysis")
-    if is_persona_relevant(message.content):
-        modes.append("persona_refresh")
-    return [mode for mode in ANALYSIS_MODES if mode in modes]
-
-
-def analysis_metadata(message: ChatMessage) -> dict[str, Any]:
-    metadata = dict(message.metadata_ or {})
-    metadata.setdefault("analysis_modes", {})
-    metadata.setdefault("applicable_modes", applicable_analysis_modes(message))
-    return metadata
-
-
-def set_message_analysis_coverage(
-    message: ChatMessage,
-    mode: str,
-    *,
-    error: str | None = None,
-    analyzed_at: datetime | None = None,
-) -> None:
-    metadata = analysis_metadata(message)
-    metadata["analysis_modes"][mode] = error is None
-    metadata["applicable_modes"] = applicable_analysis_modes(message)
-    message.metadata_ = metadata
-    flag_modified(message, "metadata_")
-    message.analysis_version = ANALYSIS_VERSION
-    if error:
-        message.analysis_status = "error"
-        message.analysis_error = error
-        return
-    applicable = set(metadata["applicable_modes"])
-    completed = {key for key, value in metadata["analysis_modes"].items() if value}
-    message.analysis_status = "complete" if applicable <= completed else "partial"
-    message.analysis_error = None
-    if message.analysis_status == "complete":
-        message.analyzed_at = analyzed_at or datetime.now(timezone.utc)
-
-
-def pending_messages_for_mode(db: Session, mode: str, *, limit: int = 80) -> list[ChatMessage]:
-    candidates = (
-        db.query(ChatMessage)
-        .filter(ChatMessage.analysis_status.in_(("pending", "partial", "error")))
-        .order_by(ChatMessage.created_at)
-        .limit(300)
-        .all()
+def is_analytical_history_question(text_value: str) -> bool:
+    lower = text_value.lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "why",
+            "pattern",
+            "patterns",
+            "analy",
+            "energy",
+            "mood",
+            "symptom",
+            "trend",
+            "changed",
+            "change between",
+            "compare",
+            "how was",
+            "how were",
+        )
     )
-    selected = []
-    for message in candidates:
-        metadata = analysis_metadata(message)
-        if mode in metadata["applicable_modes"] and not metadata["analysis_modes"].get(mode):
-            selected.append(message)
-        if len(selected) >= limit:
-            break
-    return selected
 
 
 def classify_event_type(text_value: str) -> str:
@@ -338,10 +286,25 @@ def parse_natural_datetime(text_value: str, base_time: datetime | None = None) -
 
 def clean_time_item_title(text_value: str) -> str:
     title = text_value.strip()
-    title = re.sub(r"^\s*(remind me to|remind me|remember to|deadline for|deadline|todo:?|task:?|i need to|need to)\s+", "", title, flags=re.I)
-    title = re.sub(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", "", title, flags=re.I)
+    title = re.sub(
+        r"^\s*(remind me to|remind me|remember to|deadline for|deadline|todo:?|task:?|i need to|need to)\s+",
+        "",
+        title,
+        flags=re.I,
+    )
+    title = re.sub(
+        r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        "",
+        title,
+        flags=re.I,
+    )
     title = re.sub(r"\b(?:at\s*)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", "", title, flags=re.I)
-    title = re.sub(r"\b(?:by|on|for)\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b", "", title, flags=re.I)
+    title = re.sub(
+        r"\b(?:by|on|for)\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b",
+        "",
+        title,
+        flags=re.I,
+    )
     title = re.sub(r"^to\s+", "", title, flags=re.I)
     title = re.sub(r"\s+", " ", title).strip(" .:-")
     return title[:240] or text_value.strip()[:240]
@@ -403,8 +366,8 @@ def extract_entry(entry: RawEntry) -> dict[str, Any]:
     prompt = (
         "Extract LifeOS structured data from this raw log. Return JSON only with keys "
         "events, memories, and time_items. events must contain event_type, summary, occurred_at, attributes. "
-        "event_type must be one of: "
-        f"{', '.join(EVENT_TYPES)}. memories should contain kind, content, confidence, attributes. "
+        f"event_type must be one of: {', '.join(EVENT_TYPES)}. "
+        "memories should contain kind, content, confidence, attributes. "
         "time_items should contain kind, title, priority, due_at, starts_at, ends_at, attributes. "
         f"time item kind must be one of: {', '.join(TIME_ITEM_TYPES)}. "
         "Only create memories for durable preferences, traits, recurring patterns, goals, or health responses.\n\n"
@@ -489,10 +452,13 @@ def create_raw_entry(
     db.flush()
     db.execute(text("INSERT INTO raw_entries_fts(rowid, text) VALUES (:id, :text)"), {"id": entry.id, "text": entry.text})
     upsert_embedding(db, "raw_entry", entry.id, entry.text)
+    if is_persona_relevant(entry.text):
+        for memory in infer_persona_memories_from_text(db, entry.text, evidence=[{"raw_entry_id": entry.id}]):
+            upsert_embedding(db, "memory", memory.id, memory.content)
     db.commit()
     db.refresh(entry)
     process_pending_entries(db, limit=1)
-    refresh_dashboard_cards(db)
+    refresh_overview_card(db)
     db.refresh(entry)
     return entry
 
@@ -536,8 +502,7 @@ def process_pending_entries(db: Session, *, limit: int = 20) -> int:
                 )
                 upsert_embedding(db, "memory", memory.id, memory.content)
 
-            time_items = extracted.get("time_items") or []
-            for item in time_items:
+            for item in extracted.get("time_items") or []:
                 if not isinstance(item, dict):
                     continue
                 title = str(item.get("title") or "").strip()
@@ -597,11 +562,88 @@ def add_memory(
     return memory
 
 
+def infer_persona_memories_from_text(db: Session, text_value: str, *, evidence: list[dict[str, Any]]) -> list[Memory]:
+    lower = text_value.lower()
+    created: list[Memory] = []
+    if "i prefer" in lower or "i like" in lower or "i dislike" in lower:
+        created.append(
+            add_memory(
+                db,
+                kind="preference",
+                content=text_value[:500],
+                confidence=0.55,
+                attributes={"source": "direct_ingestion"},
+                evidence=evidence,
+            )
+        )
+    if "my goal" in lower or "my goals" in lower:
+        created.append(
+            add_memory(
+                db,
+                kind="goal",
+                content=text_value[:500],
+                confidence=0.6,
+                attributes={"source": "direct_ingestion"},
+                evidence=evidence,
+            )
+        )
+    if "i am" in lower or "i'm" in lower or "i tend" in lower or "i usually" in lower:
+        created.append(
+            add_memory(
+                db,
+                kind="trait",
+                content=text_value[:500],
+                confidence=0.5,
+                attributes={"source": "direct_ingestion"},
+                evidence=evidence,
+            )
+        )
+    if any(word in lower for word in ("stress", "anxious", "tired", "energized", "self-esteem", "confidence")):
+        created.append(
+            add_memory(
+                db,
+                kind="wellbeing_signal",
+                content=text_value[:500],
+                confidence=0.5,
+                attributes={"source": "direct_ingestion"},
+                evidence=evidence,
+            )
+        )
+    if any(word in lower for word in ("deep work", "focus block", "work best", "selling", "meeting")):
+        created.append(
+            add_memory(
+                db,
+                kind="work_style",
+                content=text_value[:500],
+                confidence=0.45,
+                attributes={"source": "direct_ingestion"},
+                evidence=evidence,
+            )
+        )
+    return created
+
+
+def default_persona_profile() -> dict[str, Any]:
+    return {
+        "name": "",
+        "life_stage": "",
+        "personality_summary": "",
+        "wellbeing_baseline": "",
+        "focus_areas": [],
+        "values": [],
+        "preferences": [],
+        "constraints": [],
+        "goals": [],
+        "setup": "self-building",
+    }
+
+
 def ensure_persona(db: Session) -> PersonaProfile:
     persona = db.get(PersonaProfile, 1)
     if persona:
+        persona.profile = {**default_persona_profile(), **(persona.profile or {})}
         return persona
-    persona = PersonaProfile(id=1, timezone=settings.default_timezone, profile={"setup": "self-building"})
+    persona = PersonaProfile(id=1, timezone=settings.default_timezone, profile=default_persona_profile())
     db.add(persona)
     db.commit()
     db.refresh(persona)
@@ -632,17 +674,16 @@ def add_chat_message(
     metadata: dict | None = None,
     analysis_status: str | None = None,
 ) -> ChatMessage:
-    message_metadata = metadata or {}
     message = ChatMessage(
         session_id=session.id,
         role=role,
         content=content,
         sources=sources or [],
-        metadata_=message_metadata,
-        analysis_status=analysis_status or "pending",
+        metadata_=metadata or {},
+        analysis_status=analysis_status or "complete",
         analysis_version=ANALYSIS_VERSION,
     )
-    message.metadata_ = {**message.metadata_, "applicable_modes": applicable_analysis_modes(message), "analysis_modes": {}}
+    message.analyzed_at = datetime.now(timezone.utc)
     session.last_message_at = datetime.now(timezone.utc)
     db.add(message)
     db.flush()
@@ -651,7 +692,10 @@ def add_chat_message(
 
 def record_chat_turn(db: Session, message: str, *, session_id: int | None = None) -> tuple[str, list[dict], int]:
     session = get_or_create_chat_session(db, session_id=session_id)
-    user_message = add_chat_message(db, session=session, role="user", content=message, analysis_status="pending")
+    user_message = add_chat_message(db, session=session, role="user", content=message)
+    if is_persona_relevant(message):
+        for memory in infer_persona_memories_from_text(db, message, evidence=[{"chat_message_id": user_message.id}]):
+            upsert_embedding(db, "memory", memory.id, memory.content)
     created_items = []
     for item in extract_time_items_from_text(
         message,
@@ -664,13 +708,10 @@ def record_chat_turn(db: Session, message: str, *, session_id: int | None = None
     if created_items:
         item_lines = "\n".join(f"- {item.kind}: {item.title}" for item in created_items)
         answer = f"Added to Daily Execution:\n{item_lines}\n\n{answer}"
-        sources = [
-            {"type": "time_item", "id": item.id, "kind": item.kind, "title": item.title}
-            for item in created_items
-        ] + sources
-    add_chat_message(db, session=session, role="assistant", content=answer, sources=sources, analysis_status="pending")
+        sources = [{"type": "time_item", "id": item.id, "kind": item.kind, "title": item.title} for item in created_items] + sources
+    add_chat_message(db, session=session, role="assistant", content=answer, sources=sources)
     db.commit()
-    refresh_dashboard_cards(db)
+    refresh_overview_card(db)
     return answer, sources, session.id
 
 
@@ -691,250 +732,414 @@ def time_item_to_card_item(item: TimeItem) -> dict[str, Any]:
     }
 
 
-def build_execution_card(db: Session) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    today_start = start_of_day(now)
-    today_end = end_of_day(now)
-    open_items = (
-        db.query(TimeItem)
-        .filter(TimeItem.status.in_(("open", "snoozed")))
-        .order_by(TimeItem.due_at.is_(None), TimeItem.due_at, desc(TimeItem.priority), TimeItem.created_at)
-        .limit(40)
-        .all()
-    )
-    overdue = [item for item in open_items if db_utc(item.due_at) and db_utc(item.due_at) < now]
-    due_today = [item for item in open_items if db_utc(item.due_at) and today_start <= db_utc(item.due_at) < today_end]
-    next_actions = [item for item in open_items if item.kind in {"task", "open_loop", "reminder"}][:6]
-    scheduled = [item for item in open_items if item.kind in {"deadline", "event", "time_block"}][:6]
-
-    if overdue:
-        summary = f"{len(overdue)} overdue item{'s' if len(overdue) != 1 else ''}; clear these first."
-    elif due_today:
-        summary = f"{len(due_today)} item{'s' if len(due_today) != 1 else ''} due today."
-    elif open_items:
-        summary = "No urgent deadline found. Pick the next concrete action and protect focus time."
-    else:
-        summary = "No open tasks or deadlines yet. Add them in natural language."
-
-    sections = [
-        {"title": "Next Actions", "items": [time_item_to_card_item(item) for item in next_actions]},
-        {"title": "Reminders & Deadlines", "items": [time_item_to_card_item(item) for item in scheduled]},
-    ]
-    return {
-        "mode": "execution",
-        "card_type": "daily_execution",
-        "title": "Daily Execution",
-        "priority": 95,
-        "summary": summary,
-        "metrics": {
-            "open": len(open_items),
-            "overdue": len(overdue),
-            "due_today": len(due_today),
-        },
-        "sections": sections,
-        "evidence": [{"object_type": "time_item", "object_id": item.id} for item in open_items[:12]],
-    }
+def normalize_string_list(value: Any, *, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text_value = str(item).strip()
+        if text_value and text_value not in items:
+            items.append(text_value[:240])
+        if len(items) >= limit:
+            break
+    return items
 
 
-def build_analysis_card(db: Session) -> dict[str, Any]:
-    since = datetime.now(timezone.utc) - timedelta(days=7)
-    events = db.query(ExtractedEvent).filter(ExtractedEvent.occurred_at >= since).order_by(desc(ExtractedEvent.occurred_at)).all()
-    analysis_messages = [
-        message
-        for message in db.query(ChatMessage).filter(ChatMessage.created_at >= since).order_by(desc(ChatMessage.created_at)).limit(40).all()
-        if is_self_analysis_relevant(message.content)
-    ][:8]
-    counts = {event_type: sum(1 for event in events if event.event_type == event_type) for event_type in EVENT_TYPES}
-    performance_events = [
-        event
-        for event in events
-        if event.event_type in {"meal", "sleep", "mood", "symptom", "exercise", "work"}
-    ][:8]
-    if not events and not analysis_messages:
-        summary = "No recent logs to analyze yet."
-    elif counts["meal"] and (counts["mood"] or counts["symptom"]):
-        summary = "Diet, energy, and symptom data are starting to form a useful pattern."
-    else:
-        summary = f"{len(events)} recent event{'s' if len(events) != 1 else ''} and {len(analysis_messages)} chat signal{'s' if len(analysis_messages) != 1 else ''} available for pattern analysis."
-    return {
-        "mode": "analysis",
-        "card_type": "self_analysis",
-        "title": "Self Analysis",
-        "priority": 80,
-        "summary": summary,
-        "metrics": {
-            "events_7d": len(events),
-            "meals": counts["meal"],
-            "mood_energy": counts["mood"],
-            "symptoms": counts["symptom"],
-            "chat_signals": len(analysis_messages),
-        },
-        "sections": [
-            {
-                "title": "Recent Signals",
-                "items": [
-                    {
-                        "id": event.id,
-                        "label": event.summary,
-                        "kind": event.event_type,
-                        "occurred_at": event.occurred_at.isoformat(),
-                    }
-                    for event in performance_events
-                ]
-                + [
-                    {
-                        "id": message.id,
-                        "label": message.content,
-                        "kind": "chat",
-                        "occurred_at": message.created_at.isoformat(),
-                    }
-                    for message in analysis_messages
-                ],
-            }
-        ],
-        "evidence": [{"object_type": "event", "object_id": event.id} for event in performance_events]
-        + [{"object_type": "chat_message", "object_id": message.id} for message in analysis_messages],
-    }
+def summarize_recent_items(items: list[str], empty_value: str) -> list[str]:
+    return items[:4] if items else [empty_value]
 
 
-def build_journal_card(db: Session) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    today_start = start_of_day(now)
-    today_end = end_of_day(now)
+def window_signal_data(db: Session, start: datetime, end: datetime) -> dict[str, Any]:
     entries = (
         db.query(RawEntry)
-        .filter(RawEntry.occurred_at >= today_start, RawEntry.occurred_at < today_end)
+        .filter(RawEntry.occurred_at >= start, RawEntry.occurred_at < end)
         .order_by(desc(RawEntry.occurred_at))
-        .limit(8)
+        .limit(60)
+        .all()
+    )
+    events = (
+        db.query(ExtractedEvent)
+        .filter(ExtractedEvent.occurred_at >= start, ExtractedEvent.occurred_at < end)
+        .order_by(desc(ExtractedEvent.occurred_at))
+        .limit(80)
         .all()
     )
     messages = (
         db.query(ChatMessage)
-        .filter(ChatMessage.created_at >= today_start, ChatMessage.created_at < today_end)
+        .filter(ChatMessage.created_at >= start, ChatMessage.created_at < end)
         .order_by(desc(ChatMessage.created_at))
+        .limit(60)
+        .all()
+    )
+    time_items = time_items_between(db, start, end)
+    open_loops = (
+        db.query(TimeItem)
+        .filter(TimeItem.status.in_(("open", "snoozed")))
+        .order_by(TimeItem.due_at.is_(None), TimeItem.due_at, desc(TimeItem.priority), TimeItem.created_at)
         .limit(8)
         .all()
     )
-    summary = f"{len(entries)} log{'s' if len(entries) != 1 else ''} and {len(messages)} chat message{'s' if len(messages) != 1 else ''} today."
     return {
-        "mode": "journal",
-        "card_type": "life_journal",
-        "title": "Life Journal",
-        "priority": 70,
-        "summary": summary,
-        "metrics": {"logs_today": len(entries), "chat_messages_today": len(messages)},
-        "sections": [
-            {
-                "title": "Today’s Logs",
-                "items": [
-                    {"id": entry.id, "label": entry.text, "kind": "log", "occurred_at": entry.occurred_at.isoformat()}
-                    for entry in entries
-                ],
-            },
-            {
-                "title": "Chat History",
-                "items": [
-                    {"id": message.id, "label": message.content, "kind": message.role, "occurred_at": message.created_at.isoformat()}
-                    for message in messages
-                ],
-            },
-        ],
-        "evidence": [{"object_type": "raw_entry", "object_id": entry.id} for entry in entries],
+        "entries": entries,
+        "events": events,
+        "messages": messages,
+        "time_items": time_items,
+        "open_loops": open_loops,
     }
 
 
-def build_persona_card(db: Session) -> dict[str, Any]:
-    persona = ensure_persona(db)
-    memories = (
-        db.query(Memory)
-        .filter(Memory.superseded_by_id.is_(None))
-        .order_by(desc(Memory.confidence), desc(Memory.updated_at))
-        .limit(12)
-        .all()
-    )
-    profile_items = [
-        {"label": "Timezone", "value": persona.timezone},
-        {"label": "Locale", "value": persona.locale},
+def reflection_evidence_payload(data: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for event in data["events"][:6]:
+        evidence.append({"object_type": "event", "object_id": event.id})
+    for message in data["messages"][:3]:
+        evidence.append({"object_type": "chat_message", "object_id": message.id})
+    for item in data["time_items"][:3]:
+        evidence.append({"object_type": "time_item", "object_id": item.id})
+    return evidence
+
+
+def reflection_metrics_payload(data: dict[str, Any]) -> dict[str, int]:
+    counts = {event_type: 0 for event_type in EVENT_TYPES}
+    for event in data["events"]:
+        counts[event.event_type] = counts.get(event.event_type, 0) + 1
+    return {
+        "logs": len(data["entries"]),
+        "events": len(data["events"]),
+        "chat_signals": len(data["messages"]),
+        "open_loops": len(data["open_loops"]),
+        "meals": counts["meal"],
+        "mood_signals": counts["mood"],
+        "symptoms": counts["symptom"],
+        "work_signals": counts["work"],
+    }
+
+
+def reflection_fallback_summary(
+    period_key: str,
+    anchor_date: date,
+    start: datetime,
+    end: datetime,
+    data: dict[str, Any],
+    smaller_summaries: list[ReflectionSummary],
+) -> dict[str, Any]:
+    metrics = reflection_metrics_payload(data)
+    event_lines = [event.summary for event in data["events"][:4]]
+    message_lines = [message.content for message in data["messages"][:3] if message.role == "user"]
+    open_loop_titles = [item.title for item in data["open_loops"][:5]]
+    carry_forward_seed: list[str] = []
+    for summary in smaller_summaries:
+        payload = summary.payload or {}
+        carry_forward_seed.extend(normalize_string_list(payload.get("carry_forward_points"), limit=4))
+        headline = str(payload.get("headline") or "").strip()
+        if headline:
+            carry_forward_seed.append(headline)
+    carry_forward_points = []
+    for item in carry_forward_seed:
+        if item not in carry_forward_points:
+            carry_forward_points.append(item)
+        if len(carry_forward_points) >= 4:
+            break
+    if not carry_forward_points and event_lines:
+        carry_forward_points = [event_lines[0]]
+
+    wins: list[str] = []
+    if metrics["logs"]:
+        wins.append(f"Captured {metrics['logs']} log entries in this window.")
+    if metrics["work_signals"]:
+        wins.append(f"Recorded {metrics['work_signals']} work-related signals worth preserving.")
+    if metrics["meals"] and (metrics["mood_signals"] or metrics["symptoms"]):
+        wins.append("Food, energy, or symptom data is dense enough to support pattern tracking.")
+    wins = summarize_recent_items(wins, "Keep logging concrete moments so the reflection becomes more precise.")
+
+    risks: list[str] = []
+    if open_loop_titles:
+        risks.append(f"Open loops still active: {', '.join(open_loop_titles[:3])}.")
+    if metrics["symptoms"]:
+        risks.append("Symptoms or crashes were mentioned and should stay visible in the next cycle.")
+    if not metrics["logs"]:
+        risks.append("This window is sparse, so confidence is limited.")
+    risks = summarize_recent_items(risks, "No urgent risks surfaced from the available data.")
+
+    patterns: list[str] = []
+    if event_lines:
+        patterns.append(f"Recent signal: {event_lines[0]}")
+    if len(event_lines) > 1:
+        patterns.append(f"Related signal: {event_lines[1]}")
+    if message_lines:
+        patterns.append(f"Chat context: {message_lines[0][:180]}")
+    if carry_forward_points:
+        patterns.append(f"Carry forward: {carry_forward_points[0]}")
+    patterns = summarize_recent_items(patterns, "No strong recurring pattern is visible yet.")
+
+    narrative_parts = [
+        f"{metrics['logs']} logs, {metrics['events']} structured events, and {metrics['chat_signals']} chat signals were captured.",
     ]
-    if persona.birth_year:
-        profile_items.append({"label": "Birth year", "value": str(persona.birth_year)})
-    if persona.gender:
-        profile_items.append({"label": "Gender", "value": persona.gender})
-    summary = f"{len(memories)} durable memor{'y' if len(memories) == 1 else 'ies'} with evidence-backed confidence."
+    if open_loop_titles:
+        narrative_parts.append(f"Priority open loops: {', '.join(open_loop_titles[:3])}.")
+    if carry_forward_points:
+        narrative_parts.append(f"Important context to preserve: {carry_forward_points[0]}.")
+    narrative = " ".join(narrative_parts)
+
+    headline = (
+        f"{REFLECTION_LABELS[period_key]} reflection for {anchor_date.isoformat()}: "
+        f"{metrics['logs']} logs, {metrics['events']} events, {len(open_loop_titles)} open loops."
+    )
+    body = f"{narrative} Next focus: {risks[0]}"
     return {
-        "mode": "persona",
-        "card_type": "persona_memory",
-        "title": "Persona",
-        "priority": 60,
-        "summary": summary,
-        "metrics": {"memories": len(memories), "goals": len(persona.goals or [])},
-        "sections": [
-            {"title": "Stable Profile", "items": profile_items},
-            {
-                "title": "Memories",
-                "items": [
-                    {
-                        "id": memory.id,
-                        "label": memory.content,
-                        "kind": memory.kind,
-                        "confidence": memory.confidence,
-                    }
-                    for memory in memories
-                ],
-            },
-        ],
-        "evidence": [{"object_type": "memory", "object_id": memory.id} for memory in memories],
+        "period_key": period_key,
+        "label": REFLECTION_LABELS[period_key],
+        "anchor_date": anchor_date.isoformat(),
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "title": REFLECTION_LABELS[period_key],
+        "body": body,
+        "headline": headline,
+        "narrative": narrative,
+        "wins": wins,
+        "risks": risks,
+        "patterns": patterns,
+        "carry_forward_points": carry_forward_points or wins[:1],
+        "open_loops": open_loop_titles,
+        "metrics": metrics,
+        "evidence": reflection_evidence_payload(data),
     }
 
 
-def normalize_card(card: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(card, dict):
-        return fallback
-    mode = card.get("mode") if card.get("mode") in CARD_MODES else fallback["mode"]
-    return {
-        "mode": mode,
-        "card_type": str(card.get("card_type") or fallback["card_type"])[:96],
-        "title": str(card.get("title") or fallback["title"])[:160],
-        "priority": max(0, min(100, int(card.get("priority") or fallback["priority"]))),
-        "summary": str(card.get("summary") or fallback["summary"]),
-        "metrics": card.get("metrics") if isinstance(card.get("metrics"), dict) else fallback.get("metrics", {}),
-        "sections": card.get("sections") if isinstance(card.get("sections"), list) else fallback.get("sections", []),
-        "evidence": card.get("evidence") if isinstance(card.get("evidence"), list) else fallback.get("evidence", []),
-    }
-
-
-def maybe_llm_card(db: Session, mode: str, fallback: dict[str, Any]) -> dict[str, Any]:
+def maybe_llm_reflection_summary(
+    period_key: str,
+    anchor_date: date,
+    start: datetime,
+    end: datetime,
+    data: dict[str, Any],
+    smaller_summaries: list[ReflectionSummary],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
     context = {
-        "mode": mode,
-        "fallback_card": fallback,
-        "recent_context": recent_context(db),
-        "open_time_items": [
-            time_item_to_card_item(item)
-            for item in db.query(TimeItem).filter(TimeItem.status.in_(("open", "snoozed"))).order_by(TimeItem.due_at).limit(20).all()
+        "period_key": period_key,
+        "anchor_date": anchor_date.isoformat(),
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "events": [
+            {"type": event.event_type, "occurred_at": event.occurred_at.isoformat(), "summary": event.summary}
+            for event in data["events"][:18]
         ],
+        "messages": [
+            {"role": message.role, "created_at": message.created_at.isoformat(), "content": message.content[:220]}
+            for message in data["messages"][:12]
+        ],
+        "time_items": [time_item_to_card_item(item) for item in data["time_items"][:12]],
+        "smaller_summaries": [
+            {
+                "period_key": summary.period_key,
+                "title": summary.title,
+                "body": summary.body,
+                "carry_forward_points": normalize_string_list((summary.payload or {}).get("carry_forward_points")),
+            }
+            for summary in smaller_summaries
+        ],
+        "fallback": fallback,
     }
     prompt = (
-        "You generate LifeOS dashboard cards as JSON only. Do not return HTML. "
-        "Use this schema: mode, card_type, title, priority, summary, metrics, sections, evidence. "
-        "Keep sections as an array of {title, items}; each item should be plain data with label/status/due_at when relevant. "
-        f"Generate the {mode} card from this context:\n{context}"
+        "Generate a LifeOS reflection summary as JSON only. "
+        "Return keys: title, body, headline, narrative, wins, risks, patterns, carry_forward_points, open_loops, metrics. "
+        "Keep wins/risks/patterns/carry_forward_points/open_loops as short arrays of strings. "
+        "Preserve important context from smaller summaries when relevant.\n\n"
+        f"{context}"
     )
     try:
         parsed = safe_json_object(get_llm().chat([{"role": "user", "content": prompt}], temperature=0.1))
     except Exception:
         return fallback
-    return normalize_card(parsed, fallback)
+    if not parsed:
+        return fallback
+    merged = dict(fallback)
+    merged.update(
+        {
+            "title": str(parsed.get("title") or fallback["title"])[:160],
+            "body": str(parsed.get("body") or fallback["body"]),
+            "headline": str(parsed.get("headline") or fallback["headline"]),
+            "narrative": str(parsed.get("narrative") or fallback["narrative"]),
+            "wins": normalize_string_list(parsed.get("wins")) or fallback["wins"],
+            "risks": normalize_string_list(parsed.get("risks")) or fallback["risks"],
+            "patterns": normalize_string_list(parsed.get("patterns")) or fallback["patterns"],
+            "carry_forward_points": normalize_string_list(parsed.get("carry_forward_points")) or fallback["carry_forward_points"],
+            "open_loops": normalize_string_list(parsed.get("open_loops")) or fallback["open_loops"],
+        }
+    )
+    metrics = parsed.get("metrics")
+    merged["metrics"] = metrics if isinstance(metrics, dict) else fallback["metrics"]
+    return merged
 
 
-def build_card(db: Session, mode: str, *, use_llm: bool = False) -> dict[str, Any]:
-    builders = {
-        "execution": build_execution_card,
-        "analysis": build_analysis_card,
-        "journal": build_journal_card,
-        "persona": build_persona_card,
+def upsert_reflection_summary(
+    db: Session,
+    *,
+    period_key: str,
+    anchor_date: date,
+    start: datetime,
+    end: datetime,
+    payload: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    source_summary_ids: list[int],
+) -> ReflectionSummary:
+    summary = (
+        db.query(ReflectionSummary)
+        .filter(ReflectionSummary.period_key == period_key, ReflectionSummary.anchor_date == anchor_date)
+        .one_or_none()
+    )
+    if summary is None:
+        summary = ReflectionSummary(
+            period_key=period_key,
+            anchor_date=anchor_date,
+            window_start=start,
+            window_end=end,
+            title=str(payload["title"])[:160],
+            body=str(payload["body"]),
+            payload=payload,
+            evidence=evidence,
+            source_summary_ids=source_summary_ids,
+        )
+        db.add(summary)
+        db.flush()
+        return summary
+    summary.window_start = start
+    summary.window_end = end
+    summary.title = str(payload["title"])[:160]
+    summary.body = str(payload["body"])
+    summary.payload = payload
+    summary.evidence = evidence
+    summary.source_summary_ids = source_summary_ids
+    db.flush()
+    return summary
+
+
+def generate_reflection_summaries(
+    db: Session,
+    *,
+    anchor_date: date | None = None,
+    use_llm: bool = True,
+) -> list[ReflectionSummary]:
+    anchor_date = anchor_date or latest_completed_local_day()
+    generated: list[ReflectionSummary] = []
+    for period_key, _label, days in REFLECTION_PERIODS:
+        start, end = reflection_window(anchor_date, days)
+        data = window_signal_data(db, start, end)
+        fallback = reflection_fallback_summary(period_key, anchor_date, start, end, data, generated)
+        payload = maybe_llm_reflection_summary(period_key, anchor_date, start, end, data, generated, fallback) if use_llm else fallback
+        summary = upsert_reflection_summary(
+            db,
+            period_key=period_key,
+            anchor_date=anchor_date,
+            start=start,
+            end=end,
+            payload=payload,
+            evidence=reflection_evidence_payload(data),
+            source_summary_ids=[item.id for item in generated],
+        )
+        generated.append(summary)
+    db.commit()
+    return generated
+
+
+def ensure_reflection_summaries(db: Session, *, anchor_date: date | None = None) -> list[ReflectionSummary]:
+    anchor_date = anchor_date or latest_completed_local_day()
+    existing = (
+        db.query(ReflectionSummary)
+        .filter(ReflectionSummary.anchor_date == anchor_date)
+        .order_by(ReflectionSummary.created_at)
+        .all()
+    )
+    keyed = {summary.period_key: summary for summary in existing}
+    if all(key in keyed for key, _label, _days in REFLECTION_PERIODS):
+        return [keyed[key] for key, _label, _days in REFLECTION_PERIODS]
+    return generate_reflection_summaries(db, anchor_date=anchor_date, use_llm=False)
+
+
+def serialize_reflection_summary(summary: ReflectionSummary) -> dict[str, Any]:
+    payload = summary.payload or {}
+    return {
+        "id": summary.id,
+        "period_key": summary.period_key,
+        "label": payload.get("label") or REFLECTION_LABELS.get(summary.period_key, summary.period_key),
+        "anchor_date": summary.anchor_date.isoformat(),
+        "window_start": summary.window_start.isoformat(),
+        "window_end": summary.window_end.isoformat(),
+        "title": summary.title,
+        "body": summary.body,
+        "headline": payload.get("headline", summary.title),
+        "narrative": payload.get("narrative", summary.body),
+        "wins": payload.get("wins", []),
+        "risks": payload.get("risks", []),
+        "patterns": payload.get("patterns", []),
+        "carry_forward_points": payload.get("carry_forward_points", []),
+        "open_loops": payload.get("open_loops", []),
+        "metrics": payload.get("metrics", {}),
+        "evidence": summary.evidence,
+        "source_summary_ids": summary.source_summary_ids,
+        "created_at": summary.created_at.isoformat(),
     }
-    fallback = builders[mode](db)
-    return maybe_llm_card(db, mode, fallback) if use_llm else fallback
+
+
+def urgent_items_for_overview(db: Session) -> list[TimeItem]:
+    now = datetime.now(timezone.utc)
+    today_start = start_of_day(now)
+    today_end = end_of_day(now)
+    urgent = (
+        db.query(TimeItem)
+        .filter(TimeItem.status.in_(("open", "snoozed")))
+        .filter(
+            or_(
+                TimeItem.due_at < now,
+                (TimeItem.due_at >= today_start) & (TimeItem.due_at < today_end),
+                (TimeItem.starts_at >= today_start) & (TimeItem.starts_at < today_end),
+            )
+        )
+        .order_by(TimeItem.due_at.is_(None), TimeItem.due_at, desc(TimeItem.priority), TimeItem.created_at)
+        .limit(8)
+        .all()
+    )
+    if urgent:
+        return urgent
+    return (
+        db.query(TimeItem)
+        .filter(TimeItem.status.in_(("open", "snoozed")))
+        .order_by(TimeItem.due_at.is_(None), TimeItem.due_at, desc(TimeItem.priority), TimeItem.created_at)
+        .limit(5)
+        .all()
+    )
+
+
+def build_overview_card_payload(db: Session, summaries: list[ReflectionSummary]) -> dict[str, Any]:
+    milestone_dicts = [serialize_reflection_summary(summary) for summary in summaries]
+    urgent_items = [time_item_to_card_item(item) for item in urgent_items_for_overview(db)]
+    primary = milestone_dicts[0] if milestone_dicts else None
+    card_title = f"Daily feedback for {primary['anchor_date']}" if primary else "Daily feedback"
+    risk_line = primary["risks"][0] if primary and primary.get("risks") else "No urgent risk surfaced yet."
+    message_parts = []
+    if primary:
+        message_parts.append(primary["headline"])
+    if milestone_dicts:
+        message_parts.append(f"Tracked across {len(milestone_dicts)} rolling windows.")
+    if urgent_items:
+        message_parts.append(f"{len(urgent_items)} urgent or still-open items are attached below.")
+    message_parts.append(risk_line)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "card_title": card_title,
+        "card_message": " ".join(message_parts),
+        "milestones": milestone_dicts,
+        "urgent_items": urgent_items,
+        "metrics": {
+            "milestones": len(milestone_dicts),
+            "urgent_items": len(urgent_items),
+        },
+        "sections": [
+            {"title": "Milestones", "items": milestone_dicts},
+            {"title": "Urgent items", "items": urgent_items},
+        ],
+        "evidence": [item for summary in milestone_dicts for item in summary.get("evidence", [])[:2]],
+    }
 
 
 def persist_dashboard_card(
@@ -944,9 +1149,7 @@ def persist_dashboard_card(
     create_report: bool = False,
     report_date: date | None = None,
 ) -> DashboardCard:
-    db.query(DashboardCard).filter(DashboardCard.mode == card["mode"], DashboardCard.status == "active").update(
-        {"status": "archived"}
-    )
+    db.query(DashboardCard).filter(DashboardCard.mode == card["mode"], DashboardCard.status == "active").update({"status": "archived"})
     persisted = DashboardCard(
         mode=card["mode"],
         card_type=card["card_type"],
@@ -974,6 +1177,37 @@ def persist_dashboard_card(
     return persisted
 
 
+def refresh_overview_card(db: Session, *, anchor_date: date | None = None) -> DashboardCard:
+    summaries = ensure_reflection_summaries(db, anchor_date=anchor_date)
+    payload = build_overview_card_payload(db, summaries)
+    card = {
+        "mode": "overview",
+        "card_type": "reflection_overview",
+        "title": payload["card_title"],
+        "summary": payload["card_message"],
+        "priority": 95,
+        "metrics": payload["metrics"],
+        "sections": payload["sections"],
+        "milestones": payload["milestones"],
+        "urgent_items": payload["urgent_items"],
+        "generated_at": payload["generated_at"],
+        "evidence": payload["evidence"],
+    }
+    return persist_dashboard_card(db, card, create_report=False)
+
+
+def ensure_overview_card(db: Session) -> DashboardCard:
+    card = (
+        db.query(DashboardCard)
+        .filter(DashboardCard.mode == "overview", DashboardCard.status == "active")
+        .order_by(desc(DashboardCard.created_at))
+        .first()
+    )
+    if card:
+        return card
+    return refresh_overview_card(db)
+
+
 def refresh_dashboard_cards(
     db: Session,
     *,
@@ -981,32 +1215,12 @@ def refresh_dashboard_cards(
     use_llm: bool = False,
     create_reports: bool = False,
 ) -> dict[str, DashboardCard]:
-    selected_modes = modes or CARD_ORDER
-    cards: dict[str, DashboardCard] = {}
-    for mode in selected_modes:
-        if mode not in CARD_MODES:
-            continue
-        cards[mode] = persist_dashboard_card(db, build_card(db, mode, use_llm=use_llm), create_report=create_reports)
-    return cards
+    del modes, use_llm, create_reports
+    return {"overview": refresh_overview_card(db)}
 
 
 def ensure_dashboard_cards(db: Session) -> dict[str, DashboardCard]:
-    cards: dict[str, DashboardCard] = {}
-    missing = []
-    for mode in CARD_ORDER:
-        card = (
-            db.query(DashboardCard)
-            .filter(DashboardCard.mode == mode, DashboardCard.status == "active")
-            .order_by(desc(DashboardCard.created_at))
-            .first()
-        )
-        if card:
-            cards[mode] = card
-        else:
-            missing.append(mode)
-    if missing:
-        cards.update(refresh_dashboard_cards(db, modes=missing))
-    return cards
+    return {"overview": ensure_overview_card(db)}
 
 
 def card_to_dict(card: DashboardCard) -> dict[str, Any]:
@@ -1020,138 +1234,85 @@ def card_to_dict(card: DashboardCard) -> dict[str, Any]:
         "priority": card.priority,
         "metrics": payload.get("metrics", {}),
         "sections": payload.get("sections", []),
+        "milestones": payload.get("milestones", []),
+        "urgent_items": payload.get("urgent_items", []),
+        "generated_at": payload.get("generated_at") or card.created_at.isoformat(),
         "evidence": card.evidence,
         "created_at": card.created_at.isoformat(),
     }
 
 
 def infer_persona_memories_from_message(db: Session, message: ChatMessage) -> list[Memory]:
-    lower = message.content.lower()
-    memories: list[Memory] = []
-    if "self-esteem" in lower or "confidence" in lower:
-        memories.append(
-            add_memory(
-                db,
-                kind="self_belief",
-                content=f"User reported: {message.content[:240]}",
-                confidence=0.45,
-                attributes={"source": "chat_analysis"},
-                evidence=[{"chat_message_id": message.id}],
-            )
-        )
-    if "i prefer" in lower or "i like" in lower or "i dislike" in lower:
-        memories.append(
-            add_memory(
-                db,
-                kind="preference",
-                content=message.content[:500],
-                confidence=0.5,
-                attributes={"source": "chat_analysis"},
-                evidence=[{"chat_message_id": message.id}],
-            )
-        )
-    if "my goal" in lower or "my goals" in lower:
-        memories.append(
-            add_memory(
-                db,
-                kind="goal",
-                content=message.content[:500],
-                confidence=0.55,
-                attributes={"source": "chat_analysis"},
-                evidence=[{"chat_message_id": message.id}],
-            )
-        )
-    return memories
+    return infer_persona_memories_from_text(db, message.content, evidence=[{"chat_message_id": message.id}])
 
 
-def next_hourly_analysis_mode(db: Session) -> str:
-    last = (
-        db.query(AgentRun)
-        .filter(AgentRun.job_name == "hourly_analysis", AgentRun.status == "success", AgentRun.mode.in_(ANALYSIS_MODES))
-        .order_by(desc(AgentRun.finished_at), desc(AgentRun.started_at))
-        .first()
-    )
-    if not last or last.mode not in ANALYSIS_MODES:
-        return ANALYSIS_MODES[0]
-    return ANALYSIS_MODES[(ANALYSIS_MODES.index(last.mode) + 1) % len(ANALYSIS_MODES)]
+def persona_group_name(kind: str) -> str:
+    mapping = {
+        "trait": "traits",
+        "preference": "preferences",
+        "goal": "goals",
+        "wellbeing_signal": "wellbeing_signals",
+        "diet_response": "health_patterns",
+        "health_pattern": "health_patterns",
+        "work_style": "work_style",
+        "self_belief": "wellbeing_signals",
+    }
+    return mapping.get(kind, "other")
 
 
-def analysis_card_modes(mode: str) -> tuple[str, ...]:
+def persona_stable_profile(persona: PersonaProfile) -> dict[str, Any]:
+    profile = {**default_persona_profile(), **(persona.profile or {})}
     return {
-        "daily_execution": ("execution",),
-        "self_analysis": ("analysis",),
-        "life_journal": ("journal",),
-        "persona_refresh": ("persona",),
-    }.get(mode, ())
+        "birth_year": persona.birth_year,
+        "gender": persona.gender,
+        "locale": persona.locale,
+        "timezone": persona.timezone,
+        "name": profile["name"],
+        "life_stage": profile["life_stage"],
+        "personality_summary": profile["personality_summary"],
+        "wellbeing_baseline": profile["wellbeing_baseline"],
+        "focus_areas": profile["focus_areas"],
+        "values": profile["values"],
+        "preferences": profile["preferences"],
+        "constraints": profile["constraints"],
+        "goals": profile["goals"],
+    }
 
 
-def run_mode_analysis(db: Session, mode: str) -> tuple[list[int], list[int]]:
-    messages = pending_messages_for_mode(db, mode)
-    now = datetime.now(timezone.utc)
-    for message in messages:
-        try:
-            if mode == "daily_execution" and message.role == "user":
-                existing = (
-                    db.query(TimeItem)
-                    .filter(TimeItem.source_type == "chat_message", TimeItem.source_id == message.id)
-                    .first()
-                )
-                if not existing:
-                    for item in extract_time_items_from_text(
-                        message.content,
-                        base_time=db_utc(message.created_at) or now,
-                        source_type="chat_message",
-                        source_id=message.id,
-                    ):
-                        add_time_item(db, **item)
-            if mode == "persona_refresh" and message.role == "user":
-                for memory in infer_persona_memories_from_message(db, message):
-                    upsert_embedding(db, "memory", memory.id, memory.content)
-            set_message_analysis_coverage(message, mode, analyzed_at=now)
-        except Exception as exc:
-            set_message_analysis_coverage(message, mode, error=str(exc))
-    db.commit()
-
-    created_cards = refresh_dashboard_cards(
-        db,
-        modes=analysis_card_modes(mode),
-        use_llm=True,
-        create_reports=True,
+def grouped_persona_memories(db: Session) -> dict[str, list[dict[str, Any]]]:
+    memories = (
+        db.query(Memory)
+        .filter(Memory.superseded_by_id.is_(None))
+        .order_by(desc(Memory.confidence), desc(Memory.updated_at))
+        .all()
     )
-    return [message.id for message in messages], [card.id for card in created_cards.values()]
-
-
-def reflect_recent_data(db: Session) -> Recommendation | None:
-    since = datetime.now(timezone.utc) - timedelta(days=7)
-    events = db.query(ExtractedEvent).filter(ExtractedEvent.occurred_at >= since).order_by(desc(ExtractedEvent.occurred_at)).all()
-    if not events:
-        return None
-    meal_count = sum(1 for event in events if event.event_type == "meal")
-    symptom_count = sum(1 for event in events if event.event_type == "symptom")
-    mood_count = sum(1 for event in events if event.event_type == "mood")
-    title = "Recent pattern to watch"
-    if meal_count and symptom_count:
-        body = "You logged meals and possible energy or symptom changes recently. Keep noting meal timing, caffeine, energy, focus, and crashes so LifeOS can find stronger diet-performance patterns."
-    elif mood_count:
-        body = "You have recent mood or energy logs. Add context about sleep, caffeine, meals, and work blocks to make future advice more specific."
-    else:
-        body = "You have new logs. Keep using natural language; LifeOS will preserve raw entries and extract more structure over time."
-    recommendation = Recommendation(
-        title=title,
-        body=body,
-        evidence=[{"event_ids": [event.id for event in events[:12]]}],
-    )
-    db.add(recommendation)
-    db.commit()
-    db.refresh(recommendation)
-    return recommendation
+    groups: dict[str, list[dict[str, Any]]] = {
+        "traits": [],
+        "preferences": [],
+        "goals": [],
+        "health_patterns": [],
+        "work_style": [],
+        "wellbeing_signals": [],
+        "other": [],
+    }
+    for memory in memories:
+        groups[persona_group_name(memory.kind)].append(
+            {
+                "id": memory.id,
+                "kind": memory.kind,
+                "content": memory.content,
+                "confidence": memory.confidence,
+                "evidence": memory.evidence,
+                "updated_at": memory.updated_at.isoformat(),
+            }
+        )
+    return groups
 
 
 def run_job(db: Session, job_name: str) -> AgentRun:
-    mode = next_hourly_analysis_mode(db) if job_name == "hourly_analysis" else job_name if job_name in ANALYSIS_MODES else None
     run = AgentRun(
         job_name=job_name,
-        mode=mode,
+        mode=None,
         model=settings.ollama_model,
         prompt_version=PROMPT_VERSION,
         status="running",
@@ -1164,33 +1325,18 @@ def run_job(db: Session, job_name: str) -> AgentRun:
     try:
         if job_name == "ingest":
             count = process_pending_entries(db)
-            refresh_dashboard_cards(db, modes=("execution", "analysis", "journal", "persona"))
-            run.summary = f"Processed {count} pending entries and refreshed dashboard cards."
-        elif job_name == "hourly_analysis":
-            input_ids, card_ids = run_mode_analysis(db, mode or "daily_execution")
-            run.input_message_ids = input_ids
-            run.output_card_ids = card_ids
-            run.summary = f"Ran {mode} analysis over {len(input_ids)} message(s)."
-        elif job_name in ANALYSIS_MODES:
-            if job_name == "self_analysis":
-                reflect_recent_data(db)
-            if job_name == "persona_refresh":
-                ensure_persona(db)
-            input_ids, card_ids = run_mode_analysis(db, job_name)
-            run.input_message_ids = input_ids
-            run.output_card_ids = card_ids
-            run.summary = f"Ran {job_name} analysis over {len(input_ids)} message(s)."
-        elif job_name in {"reflect", "nightly"}:
-            reflect_recent_data(db)
-            all_input_ids: list[int] = []
-            all_card_ids: list[int] = []
-            for selected_mode in ANALYSIS_MODES:
-                input_ids, card_ids = run_mode_analysis(db, selected_mode)
-                all_input_ids.extend(input_ids)
-                all_card_ids.extend(card_ids)
-            run.input_message_ids = sorted(set(all_input_ids))
-            run.output_card_ids = all_card_ids
-            run.summary = "Generated execution, analysis, journal, and persona cards."
+            card = refresh_overview_card(db)
+            run.output_card_ids = [card.id]
+            run.summary = f"Processed {count} pending entries and refreshed overview."
+        elif job_name == "overview_refresh":
+            card = refresh_overview_card(db)
+            run.output_card_ids = [card.id]
+            run.summary = "Rebuilt the active overview card."
+        elif job_name == "summary_rollup":
+            summaries = generate_reflection_summaries(db, anchor_date=latest_completed_local_day(), use_llm=False)
+            card = refresh_overview_card(db, anchor_date=latest_completed_local_day())
+            run.output_card_ids = [card.id]
+            run.summary = f"Generated {len(summaries)} milestone summaries and refreshed overview."
         else:
             run.summary = "No-op job."
         run.status = "success"
@@ -1218,13 +1364,20 @@ def time_items_between(db: Session, start: datetime, end: datetime) -> list[Time
     )
 
 
-def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
-    date_range = parse_date_range(message)
-    sources: list[dict] = []
-    if date_range:
-        events = events_between(db, *date_range)
-        time_items = time_items_between(db, *date_range)
-        sources = [
+def format_local_timestamp(value: datetime | None, timezone_name: str) -> str:
+    if value is None:
+        return ""
+    local_value = db_utc(value).astimezone(local_tz(timezone_name))
+    return local_value.strftime("%Y-%m-%d %H:%M")
+
+
+def history_sources(context: HistoricalContext) -> list[dict[str, Any]]:
+    return [
+        *[
+            {"type": "raw_entry", "id": entry.id, "occurred_at": entry.occurred_at.isoformat(), "text": entry.text}
+            for entry in context.logs
+        ],
+        *[
             {
                 "type": "event",
                 "id": event.id,
@@ -1232,26 +1385,226 @@ def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
                 "occurred_at": event.occurred_at.isoformat(),
                 "summary": event.summary,
             }
-            for event in events
-        ] + [
+            for event in context.events
+        ],
+        *[
             {
                 "type": "time_item",
                 "id": item.id,
                 "kind": item.kind,
+                "status": item.status,
                 "due_at": item.due_at.isoformat() if item.due_at else None,
+                "starts_at": item.starts_at.isoformat() if item.starts_at else None,
                 "title": item.title,
             }
-            for item in time_items
-        ]
-        if not events and not time_items:
-            return "I could not find any logged events, tasks, reminders, or deadlines for that date.", sources
-        lines = [f"{event.occurred_at:%H:%M} [{event.event_type}] {event.summary}" for event in events]
-        lines += [
-            f"{(item.due_at or item.starts_at):%H:%M} [{item.kind}] {item.title}"
-            for item in time_items
-            if item.due_at or item.starts_at
-        ]
-        return "Here is what I found from your database:\n" + "\n".join(lines), sources
+            for item in context.time_items
+        ],
+        *[
+            {
+                "type": "chat_message",
+                "id": message.id,
+                "role": message.role,
+                "created_at": message.created_at.isoformat(),
+                "content": message.content,
+            }
+            for message in context.chat_messages
+        ],
+        *[
+            {
+                "type": "reflection_summary",
+                "id": summary.id,
+                "period_key": summary.period_key,
+                "anchor_date": summary.anchor_date.isoformat(),
+                "title": summary.title,
+                "body": summary.body,
+            }
+            for summary in context.reflection_summaries
+        ],
+        *[
+            {
+                "type": "memory",
+                "id": memory.id,
+                "kind": memory.kind,
+                "confidence": memory.confidence,
+                "content": memory.content,
+            }
+            for memory in context.memories
+        ],
+    ]
+
+
+def context_has_data(context: HistoricalContext) -> bool:
+    return bool(context.logs or context.events or context.time_items or context.chat_messages)
+
+
+def context_counts(context: HistoricalContext) -> dict[str, int]:
+    return {
+        "logs": len(context.logs),
+        "events": len(context.events),
+        "time_items": len(context.time_items),
+        "chat_messages": len(context.chat_messages),
+        "reflection_summaries": len(context.reflection_summaries),
+        "memories": len(context.memories),
+    }
+
+
+def render_historical_timeline(context: HistoricalContext, timezone_name: str) -> str:
+    timeline: list[tuple[datetime, str]] = []
+    for entry in context.logs:
+        timeline.append((entry.occurred_at, f"{format_local_timestamp(entry.occurred_at, timezone_name)} [log] {entry.text}"))
+    for event in context.events:
+        timeline.append((event.occurred_at, f"{format_local_timestamp(event.occurred_at, timezone_name)} [{event.event_type}] {event.summary}"))
+    for item in context.time_items:
+        when = item.due_at or item.starts_at
+        if when:
+            timeline.append((when, f"{format_local_timestamp(when, timezone_name)} [{item.kind}] {item.title}"))
+    for message in context.chat_messages:
+        timeline.append(
+            (
+                message.created_at,
+                f"{format_local_timestamp(message.created_at, timezone_name)} [chat:{message.role}] {message.content[:200]}",
+            )
+        )
+    timeline.sort(key=lambda item: item[0])
+    if not timeline:
+        return ""
+    return "\n".join(line for _when, line in timeline[:24])
+
+
+def historical_context_payload(context: HistoricalContext) -> dict[str, Any]:
+    return {
+        "query_type": "historical_analysis",
+        "resolved_window_start": context.window.start_utc.isoformat(),
+        "resolved_window_end": context.window.end_utc.isoformat(),
+        "local_window_label": context.window.label,
+        "logs": [
+            {"id": entry.id, "occurred_at": entry.occurred_at.isoformat(), "text": entry.text}
+            for entry in context.logs[:20]
+        ],
+        "events": [
+            {"id": event.id, "event_type": event.event_type, "occurred_at": event.occurred_at.isoformat(), "summary": event.summary}
+            for event in context.events[:24]
+        ],
+        "time_items": [
+            {
+                "id": item.id,
+                "kind": item.kind,
+                "title": item.title,
+                "status": item.status,
+                "due_at": item.due_at.isoformat() if item.due_at else None,
+                "starts_at": item.starts_at.isoformat() if item.starts_at else None,
+            }
+            for item in context.time_items[:24]
+        ],
+        "chat_messages": [
+            {"id": message.id, "role": message.role, "created_at": message.created_at.isoformat(), "content": message.content[:240]}
+            for message in context.chat_messages[:18]
+        ],
+        "reflection_summaries": [
+            {"id": summary.id, "period_key": summary.period_key, "title": summary.title, "body": summary.body}
+            for summary in context.reflection_summaries[:10]
+        ],
+        "memories": [
+            {"id": memory.id, "kind": memory.kind, "confidence": memory.confidence, "content": memory.content}
+            for memory in context.memories[:12]
+        ],
+    }
+
+
+def answer_historical_facts(context: HistoricalContext, timezone_name: str) -> str:
+    counts = context_counts(context)
+    if not context_has_data(context):
+        return f"I could not find any logs, events, tasks, chat messages, or summaries for {context.window.label}."
+    lead = (
+        f"Here is the grounded record for {context.window.label}: "
+        f"{counts['logs']} logs, {counts['events']} events, {counts['time_items']} time items, "
+        f"and {counts['chat_messages']} chat messages."
+    )
+    timeline = render_historical_timeline(context, timezone_name)
+    if timeline:
+        return lead + "\n" + timeline
+    return lead
+
+
+def fallback_historical_analysis(
+    message: str,
+    context: HistoricalContext,
+    timezone_name: str,
+    *,
+    comparison: HistoricalContext | None = None,
+) -> str:
+    primary_counts = context_counts(context)
+    if comparison:
+        comparison_counts = context_counts(comparison)
+        return (
+            f"Grounded comparison for {context.window.label} versus {comparison.window.label}: "
+            f"{context.window.label} has {primary_counts['logs']} logs, {primary_counts['events']} events, "
+            f"and {primary_counts['time_items']} time items; "
+            f"{comparison.window.label} has {comparison_counts['logs']} logs, {comparison_counts['events']} events, "
+            f"and {comparison_counts['time_items']} time items. "
+            "The database supports a comparison, but Ollama is unavailable for deeper synthesis right now."
+        )
+    timeline = render_historical_timeline(context, timezone_name)
+    lead = (
+        f"Grounded analysis input for {context.window.label}: "
+        f"{primary_counts['logs']} logs, {primary_counts['events']} events, {primary_counts['time_items']} time items, "
+        f"and {primary_counts['chat_messages']} chat messages."
+    )
+    if timeline:
+        return lead + "\n" + timeline
+    return lead + " The window is sparse, so any analysis would be low confidence."
+
+
+def answer_historical_analysis(
+    db: Session,
+    message: str,
+    context: HistoricalContext,
+    timezone_name: str,
+    *,
+    comparison: HistoricalContext | None = None,
+) -> str:
+    if not context_has_data(context) and not (comparison and context_has_data(comparison)):
+        return f"I could not find enough grounded data to analyze {context.window.label}."
+    payload = {"primary": historical_context_payload(context)}
+    if comparison:
+        payload["comparison"] = historical_context_payload(comparison)
+    system = (
+        "You are LifeOS, a local personal assistant. Analyze only the supplied historical database context. "
+        "Ground every claim in the evidence. If the window is sparse, say so. "
+        "For factual references, do not invent missing events."
+    )
+    try:
+        return get_llm().chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Historical context:\n{payload}\n\nQuestion:\n{message}"},
+            ],
+            temperature=0.1,
+        )
+    except Exception:
+        return fallback_historical_analysis(message, context, timezone_name, comparison=comparison)
+
+
+def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
+    persona = ensure_persona(db)
+    timezone_name = persona.timezone or settings.default_timezone
+    comparison_windows = parse_comparison_time_windows(message, timezone_name=timezone_name)
+    primary_window = parse_time_window(message, timezone_name=timezone_name)
+    if comparison_windows:
+        left_context = historical_context(db, comparison_windows[0], include_memories=is_analytical_history_question(message))
+        right_context = historical_context(db, comparison_windows[1], include_memories=is_analytical_history_question(message))
+        sources = history_sources(left_context) + history_sources(right_context)
+        if is_analytical_history_question(message):
+            return answer_historical_analysis(db, message, left_context, timezone_name, comparison=right_context), sources
+        left_answer = answer_historical_facts(left_context, timezone_name)
+        right_answer = answer_historical_facts(right_context, timezone_name)
+        return left_answer + "\n\n" + right_answer, sources
+    if primary_window:
+        context = historical_context(db, primary_window, include_memories=is_analytical_history_question(message))
+        sources = history_sources(context)
+        if is_analytical_history_question(message):
+            return answer_historical_analysis(db, message, context, timezone_name), sources
+        return answer_historical_facts(context, timezone_name), sources
 
     semantic = semantic_search(db, message, limit=6)
     context = recent_context(db)

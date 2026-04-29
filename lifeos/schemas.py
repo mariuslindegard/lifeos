@@ -46,3 +46,19 @@ class ChatResponse(BaseModel):
 
 class SnoozeRequest(BaseModel):
     days: int = Field(default=1, ge=1, le=30)
+
+
+class PersonaStableProfileUpdate(BaseModel):
+    birth_year: int | None = None
+    gender: str | None = Field(default=None, max_length=64)
+    locale: str | None = Field(default=None, max_length=32)
+    timezone: str | None = Field(default=None, max_length=64)
+    name: str | None = Field(default=None, max_length=160)
+    life_stage: str | None = Field(default=None, max_length=160)
+    personality_summary: str | None = Field(default=None, max_length=1200)
+    wellbeing_baseline: str | None = Field(default=None, max_length=1200)
+    focus_areas: list[str] | None = None
+    values: list[str] | None = None
+    preferences: list[str] | None = None
+    constraints: list[str] | None = None
+    goals: list[str] | None = None

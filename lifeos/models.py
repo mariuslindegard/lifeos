@@ -184,3 +184,18 @@ class DailyReport(TimestampMixin, Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     evidence: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+
+class ReflectionSummary(TimestampMixin, Base):
+    __tablename__ = "reflection_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    period_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    anchor_date: Mapped[date] = mapped_column(Date, nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    evidence: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    source_summary_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
