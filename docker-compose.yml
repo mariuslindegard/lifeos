@@ -2,6 +2,13 @@ services:
   app:
     build: .
     restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false
+      ollama-pull:
+        condition: service_completed_successfully
+        required: false
     environment:
       LIFEOS_ENV: ${LIFEOS_ENV:-production}
       LIFEOS_PASSWORD: ${LIFEOS_PASSWORD:-changeme}
@@ -53,16 +60,14 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - ollama pull "$$OLLAMA_MODEL" && ollama pull "$$OLLAMA_EMBED_MODEL"
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
       OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
-    command:
-      - /bin/sh
-      - -c
-      - |
-        ollama pull "$$OLLAMA_MODEL"
-        ollama pull "$$OLLAMA_EMBED_MODEL"
 
 volumes:
   lifeos_data:
