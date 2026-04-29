@@ -1,0 +1,48 @@
+services:
+  app:
+    build: .
+    environment:
+      LIFEOS_ENV: ${LIFEOS_ENV:-production}
+      LIFEOS_PASSWORD: ${LIFEOS_PASSWORD:-changeme}
+      LIFEOS_SECRET_KEY: ${LIFEOS_SECRET_KEY:-replace-with-a-long-random-secret}
+      LIFEOS_COOKIE_SECURE: ${LIFEOS_COOKIE_SECURE:-false}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/lifeos.db}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:4b}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lifeos_data:/app/data
+    ports:
+      - "8000:8000"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    depends_on:
+      - app
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://lifeos.local}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+
+volumes:
+  lifeos_data:
+  caddy_data:
+  caddy_config:
+  ollama_data:

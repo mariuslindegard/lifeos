@@ -1,0 +1,12 @@
+{
+  local_certs
+}
+
+lifeos.local {
+  reverse_proxy app:8000
+}
+
+localhost {
+  reverse_proxy app:8000
+}
+

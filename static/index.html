@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#101418" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="LifeOS" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/static/icon.svg" />
+    <link rel="stylesheet" href="/static/styles.css?v=5" />
+    <title>LifeOS</title>
+  </head>
+  <body>
+    <main class="shell">
+      <section id="loginView" class="login-view" hidden>
+        <form id="loginForm" class="login-panel">
+          <div>
+            <p class="eyebrow">LifeOS</p>
+            <h1>Sign in</h1>
+          </div>
+          <label>
+            <span>Password</span>
+            <input id="passwordInput" type="password" autocomplete="current-password" required />
+          </label>
+          <button type="submit">Enter</button>
+          <p id="loginError" class="error" role="alert"></p>
+        </form>
+      </section>
+
+      <section id="appView" class="app-view" hidden>
+        <section id="chatView" class="screen-view chat-screen">
+          <header class="chat-header">
+            <div>
+              <p class="eyebrow">LifeOS</p>
+              <h1>Chat</h1>
+            </div>
+            <div class="chat-header-actions">
+              <button id="historyButton" class="ghost compact-button" type="button">Chat History</button>
+              <span id="agentStatus" class="status-pill">Idle</span>
+            </div>
+          </header>
+          <div id="chatMessages" class="chat-messages"></div>
+          <form id="chatForm" class="composer">
+            <input id="chatInput" type="text" placeholder="Ask, log, remind, plan..." required />
+            <button type="submit">Send</button>
+          </form>
+        </section>
+
+        <section id="overviewView" class="screen-view overview-screen" hidden>
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">LifeOS</p>
+              <h1>Overview</h1>
+            </div>
+            <div class="topbar-actions">
+              <button id="logoutButton" class="ghost" type="button" title="Sign out">Logout</button>
+            </div>
+          </header>
+
+          <section id="cardsGrid" class="cards-grid" aria-label="LifeOS dashboard cards"></section>
+        </section>
+
+        <nav class="bottom-nav" aria-label="Primary navigation">
+          <button id="chatNavButton" class="nav-button active" type="button" data-screen="chat">Chat</button>
+          <button id="overviewNavButton" class="nav-button" type="button" data-screen="overview">Overview</button>
+        </nav>
+
+        <section id="detailModal" class="modal-shell" hidden>
+          <div class="modal-backdrop" data-close-detail></div>
+          <article class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+            <div class="panel-head">
+              <div>
+                <p id="detailMode" class="eyebrow">LifeOS</p>
+                <h2 id="detailTitle">Details</h2>
+              </div>
+              <button class="ghost" type="button" data-close-detail>Close</button>
+            </div>
+            <div id="detailContent" class="detail-content"></div>
+          </article>
+        </section>
+
+        <section id="historyModal" class="modal-shell" hidden>
+          <div class="modal-backdrop" data-close-history></div>
+          <article class="modal-panel history-panel" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">LifeOS</p>
+                <h2 id="historyTitle">Chat History</h2>
+              </div>
+              <button class="ghost" type="button" data-close-history>Close</button>
+            </div>
+            <div id="historyContent" class="history-content"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js?v=5" type="module"></script>
+  </body>
+</html>

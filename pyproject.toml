@@ -1,0 +1,27 @@
+[project]
+name = "lifeos"
+version = "0.1.0"
+description = "Local-first LifeOS with FastAPI, SQLite, Ollama, and a PWA dashboard."
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.15.0",
+  "apscheduler>=3.11.0",
+  "fastapi>=0.115.0",
+  "ollama>=0.4.7",
+  "pydantic-settings>=2.8.0",
+  "sqlalchemy>=2.0.38",
+  "uvicorn[standard]>=0.34.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28.0",
+  "pytest>=8.3.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["lifeos*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
