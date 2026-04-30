@@ -6,6 +6,8 @@ const state = {
   persona: null,
   historySessions: [],
   chatStreaming: false,
+  sessionPollTimer: null,
+  pollingSessionId: null,
   screenScroll: {
     overview: 0,
     chat: null,
@@ -450,13 +452,67 @@ function renderPersona(data) {
   }
 }
 
+function runningAssistantMessage(messages = []) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && message.analysis_status === "running") {
+      return message;
+    }
+  }
+  return null;
+}
+
+function stopSessionPolling() {
+  if (state.sessionPollTimer) {
+    clearTimeout(state.sessionPollTimer);
+    state.sessionPollTimer = null;
+  }
+  state.pollingSessionId = null;
+}
+
+function scheduleSessionPolling(sessionId) {
+  if (!sessionId) return;
+  stopSessionPolling();
+  state.pollingSessionId = sessionId;
+  state.sessionPollTimer = setTimeout(() => syncSessionFromServer(sessionId), 1200);
+}
+
+async function syncSessionFromServer(sessionId) {
+  if (!sessionId) return;
+  try {
+    const history = await api(`/api/chat/history?session_id=${sessionId}`);
+    if (state.sessionId === sessionId || state.pollingSessionId === sessionId) {
+      renderChatHistory(history.messages || []);
+    }
+    if (runningAssistantMessage(history.messages || [])) {
+      scheduleSessionPolling(sessionId);
+    } else {
+      stopSessionPolling();
+    }
+  } catch {
+    scheduleSessionPolling(sessionId);
+  }
+}
+
 function renderChatHistory(messages) {
   const chat = $("#chatMessages");
   const chatHidden = $("#chatView").hidden;
   chat.innerHTML = "";
   for (const message of messages || []) {
-    addMessage(message.role === "assistant" ? "assistant" : "user", message.content, false);
+    const isRunningAssistant = message.role === "assistant" && message.analysis_status === "running";
+    const text =
+      isRunningAssistant && !message.content
+        ? message.metadata?.thinking || message.metadata?.working_note || "Working..."
+        : message.content;
+    const extraClass = isRunningAssistant && !message.content ? "working-note" : "";
+    addMessage(message.role === "assistant" ? "assistant" : "user", text, false, extraClass);
     state.sessionId = message.session_id || state.sessionId;
+  }
+  const running = runningAssistantMessage(messages || []);
+  if (running) {
+    scheduleSessionPolling(running.session_id || state.sessionId);
+  } else {
+    stopSessionPolling();
   }
   if (chatHidden) {
     state.screenScroll.chat = null;
@@ -548,6 +604,9 @@ function setScreen(screen) {
     setKeyboardOpen(false);
   }
   restoreScreenScroll();
+  if (state.activeScreen === "chat" && !state.chatStreaming && !state.sessionId && !$("#chatMessages").childElementCount) {
+    void loadLatestChatSession();
+  }
 }
 
 async function refreshAppData() {
@@ -563,6 +622,7 @@ async function loadLatestChatSession() {
     $("#chatMessages").innerHTML = "";
     state.sessionId = null;
     state.screenScroll.chat = 0;
+    stopSessionPolling();
     return;
   }
   const latest = state.historySessions[0];
@@ -694,6 +754,7 @@ async function streamChatResponse(message) {
 }
 
 function startNewChat() {
+  stopSessionPolling();
   state.sessionId = null;
   state.screenScroll.chat = 0;
   $("#chatMessages").innerHTML = "";
@@ -760,6 +821,9 @@ $("#chatForm").addEventListener("submit", async (event) => {
   try {
     await streamChatResponse(message);
     await refreshAppData();
+    if (state.sessionId) {
+      scheduleSessionPolling(state.sessionId);
+    }
   } catch (error) {
     addMessage("assistant", String(error.message || "Streaming failed."));
   } finally {

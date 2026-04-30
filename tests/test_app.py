@@ -464,7 +464,9 @@ def test_chat_stream_supports_deterministic_history_answers_without_persisting_n
     try:
         session_messages = db.query(ChatMessage).order_by(ChatMessage.created_at).all()
         assert len(session_messages) >= 2
-        assert all("working_note" not in str(item.metadata_ or {}) for item in session_messages)
+        assistant_messages = [item for item in session_messages if item.role == "assistant"]
+        assert assistant_messages
+        assert all(item.analysis_status == "complete" for item in assistant_messages)
         assert all(item.role != "assistant" or "grounded record" in item.content.lower() for item in session_messages if item.role == "assistant")
     finally:
         db.close()

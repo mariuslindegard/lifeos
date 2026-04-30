@@ -1,5 +1,7 @@
 import re
 import json
+import threading
+import time as clock
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -8,6 +10,7 @@ from sqlalchemy import desc, or_, text
 from sqlalchemy.orm import Session
 
 from lifeos.config import settings
+from lifeos.db import SessionLocal
 from lifeos.llm import get_llm, safe_json_object
 from lifeos.models import (
     AgentRun,
@@ -735,6 +738,26 @@ def prepare_chat_turn(
     return session, user_message, created_items
 
 
+def create_assistant_placeholder(
+    db: Session,
+    *,
+    session: ChatSession,
+    working_note: str = "Working on your response.",
+) -> ChatMessage:
+    message = add_chat_message(
+        db,
+        session=session,
+        role="assistant",
+        content="",
+        sources=[],
+        metadata={"working_note": working_note, "thinking": ""},
+        analysis_status="running",
+    )
+    db.commit()
+    db.refresh(message)
+    return message
+
+
 def created_item_prefix(created_items: list[TimeItem]) -> tuple[str, list[dict[str, Any]]]:
     if not created_items:
         return "", []
@@ -742,6 +765,64 @@ def created_item_prefix(created_items: list[TimeItem]) -> tuple[str, list[dict[s
     prefix = f"Added to Daily Execution:\n{item_lines}\n\n"
     sources = [{"type": "time_item", "id": item.id, "kind": item.kind, "title": item.title} for item in created_items]
     return prefix, sources
+
+
+class PersistentTurnRecorder:
+    def __init__(self, session_id: int, assistant_message_id: int) -> None:
+        self.db = SessionLocal()
+        self.session = self.db.get(ChatSession, session_id)
+        self.message = self.db.get(ChatMessage, assistant_message_id)
+        if not self.session or not self.message:
+            raise RuntimeError("Chat session or assistant message not found")
+        self._content_started = bool(self.message.content)
+
+    def close(self) -> None:
+        self.db.close()
+
+    def _metadata(self) -> dict[str, Any]:
+        return dict(self.message.metadata_ or {})
+
+    def _commit(self) -> None:
+        self.session.last_message_at = datetime.now(timezone.utc)
+        self.db.commit()
+        self.db.refresh(self.session)
+        self.db.refresh(self.message)
+
+    def set_working_note(self, text: str) -> None:
+        metadata = self._metadata()
+        metadata["working_note"] = text
+        self.message.metadata_ = metadata
+        self._commit()
+
+    def append_thinking(self, text: str) -> None:
+        if not text or self._content_started:
+            return
+        metadata = self._metadata()
+        metadata["thinking"] = str(metadata.get("thinking") or "") + text
+        self.message.metadata_ = metadata
+        self._commit()
+
+    def append_content(self, text: str) -> None:
+        if not text:
+            return
+        self.message.content = (self.message.content or "") + text
+        self._content_started = True
+        self._commit()
+
+    def complete(self, sources: list[dict[str, Any]]) -> None:
+        self.message.sources = sources
+        self.message.analysis_status = "complete"
+        self.message.analysis_error = None
+        self._commit()
+        refresh_overview_card(self.db)
+
+    def fail(self, error_message: str) -> None:
+        if not self.message.content:
+            self.message.content = error_message
+        self.message.analysis_status = "error"
+        self.message.analysis_error = error_message
+        self._commit()
+        refresh_overview_card(self.db)
 
 
 def persist_assistant_turn(db: Session, session: ChatSession, answer: str, sources: list[dict[str, Any]]) -> None:
@@ -758,6 +839,146 @@ def record_chat_turn(db: Session, message: str, *, session_id: int | None = None
     sources = prefix_sources + sources
     persist_assistant_turn(db, session, answer, sources)
     return answer, sources, session.id
+
+
+def start_persistent_chat_turn(
+    db: Session,
+    message: str,
+    *,
+    session_id: int | None = None,
+) -> tuple[int, int]:
+    session, _user_message, created_items = prepare_chat_turn(db, message, session_id=session_id)
+    assistant = create_assistant_placeholder(db, session=session)
+    prefix_text, prefix_sources = created_item_prefix(created_items)
+    thread = threading.Thread(
+        target=run_persistent_chat_turn,
+        args=(session.id, assistant.id, message, prefix_text, prefix_sources),
+        daemon=True,
+    )
+    thread.start()
+    return session.id, assistant.id
+
+
+def run_persistent_chat_turn(
+    session_id: int,
+    assistant_message_id: int,
+    message: str,
+    prefix_text: str,
+    prefix_sources: list[dict[str, Any]],
+) -> None:
+    recorder = PersistentTurnRecorder(session_id, assistant_message_id)
+
+    def finish_with_text(answer_text: str, extra_sources: list[dict[str, Any]]) -> None:
+        full_answer = prefix_text + answer_text
+        if prefix_text:
+            recorder.append_content(prefix_text)
+        for chunk in stream_text_chunks(answer_text):
+            recorder.append_content(chunk)
+        recorder.complete(prefix_sources + extra_sources)
+
+    def stream_llm_answer(
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        fallback_text: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        final_parts = [prefix_text]
+        if prefix_text:
+            recorder.append_content(prefix_text)
+        try:
+            for delta in get_llm().chat_stream_events(messages, temperature=temperature, think=True):
+                thinking_text = str(delta.get("thinking") or "")
+                if thinking_text and not recorder.message.content:
+                    recorder.append_thinking(thinking_text)
+                content_text = str(delta.get("content") or "")
+                if not content_text:
+                    continue
+                final_parts.append(content_text)
+                recorder.append_content(content_text)
+        except Exception:
+            if not recorder.message.content:
+                final_parts = [prefix_text, fallback_text]
+                recorder.append_content(fallback_text)
+        if not "".join(final_parts).strip():
+            final_parts = [prefix_text, fallback_text]
+            if not recorder.message.content:
+                recorder.append_content(fallback_text)
+        return "".join(final_parts), prefix_sources
+
+    try:
+        db = recorder.db
+        persona = ensure_persona(db)
+        timezone_name = persona.timezone or settings.default_timezone
+        recorder.set_working_note("Checking whether this is a time-based question or a general context question.")
+        comparison_windows = parse_comparison_time_windows(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
+        primary_window = parse_time_window(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
+
+        if comparison_windows:
+            recorder.set_working_note("Retrieving both historical windows from your database.")
+            left_context = historical_context(db, comparison_windows[0], include_memories=is_analytical_history_question(message))
+            right_context = historical_context(db, comparison_windows[1], include_memories=is_analytical_history_question(message))
+            history = history_sources(left_context) + history_sources(right_context)
+            if is_analytical_history_question(message):
+                recorder.set_working_note("Analyzing the grounded comparison before drafting the answer.")
+                if not context_has_data(left_context) and not context_has_data(right_context):
+                    finish_with_text(f"I could not find enough grounded data to analyze {left_context.window.label}.", history)
+                    return
+                fallback = fallback_historical_analysis(message, left_context, timezone_name, comparison=right_context)
+                _full_answer, _ = stream_llm_answer(
+                    historical_analysis_messages(message, left_context, comparison=right_context),
+                    temperature=0.1,
+                    fallback_text=fallback,
+                )
+                recorder.complete(prefix_sources + history)
+                return
+            finish_with_text(answer_historical_facts(left_context, timezone_name) + "\n\n" + answer_historical_facts(right_context, timezone_name), history)
+            return
+
+        if primary_window:
+            recorder.set_working_note("Retrieving the requested historical window from your database.")
+            context = historical_context(db, primary_window, include_memories=is_analytical_history_question(message))
+            history = history_sources(context)
+            if is_analytical_history_question(message):
+                recorder.set_working_note("Analyzing the grounded historical context before drafting the answer.")
+                if not context_has_data(context):
+                    finish_with_text(f"I could not find enough grounded data to analyze {context.window.label}.", history)
+                    return
+                fallback = fallback_historical_analysis(message, context, timezone_name)
+                _full_answer, _ = stream_llm_answer(
+                    historical_analysis_messages(message, context),
+                    temperature=0.1,
+                    fallback_text=fallback,
+                )
+                recorder.complete(prefix_sources + history)
+                return
+            finish_with_text(answer_historical_facts(context, timezone_name), history)
+            return
+
+        recorder.set_working_note("Retrieving relevant memories, recent context, and open loops.")
+        semantic = semantic_search(db, message, limit=6)
+        context = recent_context(db)
+        context["open_time_items"] = [
+            time_item_to_card_item(item)
+            for item in db.query(TimeItem).filter(TimeItem.status.in_(("open", "snoozed"))).order_by(TimeItem.due_at).limit(20).all()
+        ]
+        payload = {"semantic_matches": semantic, "recent_context": context}
+        recorder.set_working_note("Drafting the final answer from your local context.")
+        if semantic:
+            fallback = "I found related local context, but Ollama is not reachable yet:\n" + "\n".join(
+                f"- {item['content']}" for item in semantic[:4]
+            )
+        else:
+            fallback = "I do not have enough local context yet, and Ollama is not reachable. Add logs or start Ollama, then ask again."
+        _full_answer, _ = stream_llm_answer(
+            semantic_answer_messages(message, payload),
+            temperature=0.2,
+            fallback_text=fallback,
+        )
+        recorder.complete(prefix_sources + semantic)
+    except Exception as exc:
+        recorder.fail(str(exc))
+    finally:
+        recorder.close()
 
 
 def time_item_to_card_item(item: TimeItem) -> dict[str, Any]:
@@ -1848,151 +2069,64 @@ def stream_chat_turn_events(
     *,
     session_id: int | None = None,
 ) -> Any:
-    session, _user_message, created_items = prepare_chat_turn(db, message, session_id=session_id)
-    yield {"event": "session", "data": {"session_id": session.id}}
-    prefix_text, prefix_sources = created_item_prefix(created_items)
-    if created_items:
-        yield {
-            "event": "working_note",
-            "data": {"text": f"Captured {len(created_items)} time item{'s' if len(created_items) != 1 else ''} while I work on the reply."},
-        }
-
-    def finish_with_text(answer_text: str, extra_sources: list[dict[str, Any]]) -> Any:
-        full_answer = prefix_text + answer_text
-        all_sources = prefix_sources + extra_sources
-        yield {"event": "answer_start", "data": {}}
-        for chunk in stream_text_chunks(full_answer):
-            yield {"event": "answer_delta", "data": {"text": chunk}}
-        persist_assistant_turn(db, session, full_answer, all_sources)
-        yield {"event": "sources", "data": {"items": all_sources}}
-        yield {"event": "done", "data": {}}
-
-    def stream_llm_answer(
-        messages: list[dict[str, str]],
-        *,
-        temperature: float,
-        fallback_text: str,
-    ) -> Any:
-        final_parts = [prefix_text]
-        started = False
-        if prefix_text:
-            yield {"event": "answer_start", "data": {}}
-            started = True
-            for chunk in stream_text_chunks(prefix_text):
-                yield {"event": "answer_delta", "data": {"text": chunk}}
+    persisted_session_id, assistant_message_id = start_persistent_chat_turn(db, message, session_id=session_id)
+    yield {"event": "session", "data": {"session_id": persisted_session_id, "assistant_message_id": assistant_message_id}}
+    last_note = None
+    last_thinking = ""
+    last_content = ""
+    answer_started = False
+    sources_sent = False
+    while True:
+        poll_db = SessionLocal()
         try:
-            for delta in get_llm().chat_stream_events(messages, temperature=temperature, think=True):
-                thinking_text = str(delta.get("thinking") or "")
-                if thinking_text and not started:
-                    yield {"event": "thinking_delta", "data": {"text": thinking_text}}
-                content_text = str(delta.get("content") or "")
-                if not content_text:
-                    continue
-                if not started:
+            assistant = poll_db.get(ChatMessage, assistant_message_id)
+            if not assistant:
+                yield {"event": "error", "data": {"message": "Chat response was not found."}}
+                return
+            metadata = dict(assistant.metadata_ or {})
+            note = str(metadata.get("working_note") or "")
+            thinking = str(metadata.get("thinking") or "")
+            content = assistant.content or ""
+
+            if note and note != last_note and not answer_started and not content and not thinking:
+                last_note = note
+                yield {"event": "working_note", "data": {"text": note}}
+
+            if thinking.startswith(last_thinking) and len(thinking) > len(last_thinking) and not answer_started:
+                delta = thinking[len(last_thinking):]
+                last_thinking = thinking
+                yield {"event": "thinking_delta", "data": {"text": delta}}
+
+            if content:
+                if not answer_started:
                     yield {"event": "answer_start", "data": {}}
-                    started = True
-                final_parts.append(content_text)
-                yield {"event": "answer_delta", "data": {"text": content_text}}
-        except Exception:
-            if not started:
-                yield {"event": "answer_start", "data": {}}
-                started = True
-            final_parts = [prefix_text, fallback_text]
-            for chunk in stream_text_chunks(fallback_text):
-                yield {"event": "answer_delta", "data": {"text": chunk}}
-        if not started:
-            yield {"event": "answer_start", "data": {}}
-        return "".join(final_parts)
+                    answer_started = True
+                if content.startswith(last_content) and len(content) > len(last_content):
+                    delta = content[len(last_content):]
+                    last_content = content
+                    yield {"event": "answer_delta", "data": {"text": delta}}
 
-    try:
-        persona = ensure_persona(db)
-        timezone_name = persona.timezone or settings.default_timezone
-        yield {
-            "event": "working_note",
-            "data": {"text": "Checking whether this is a time-based question or a general context question."},
-        }
-        comparison_windows = parse_comparison_time_windows(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
-        primary_window = parse_time_window(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
-
-        if comparison_windows:
-            yield {"event": "working_note", "data": {"text": "Retrieving both historical windows from your database."}}
-            left_context = historical_context(db, comparison_windows[0], include_memories=is_analytical_history_question(message))
-            right_context = historical_context(db, comparison_windows[1], include_memories=is_analytical_history_question(message))
-            history = history_sources(left_context) + history_sources(right_context)
-            if is_analytical_history_question(message):
-                yield {"event": "working_note", "data": {"text": "Analyzing the grounded comparison before drafting the answer."}}
-                if not context_has_data(left_context) and not context_has_data(right_context):
-                    yield from finish_with_text(
-                        f"I could not find enough grounded data to analyze {left_context.window.label}.",
-                        history,
-                    )
-                    return
-                fallback = fallback_historical_analysis(message, left_context, timezone_name, comparison=right_context)
-                full_answer = yield from stream_llm_answer(
-                    historical_analysis_messages(message, left_context, comparison=right_context),
-                    temperature=0.1,
-                    fallback_text=fallback,
-                )
-                all_sources = prefix_sources + history
-                persist_assistant_turn(db, session, full_answer, all_sources)
-                yield {"event": "sources", "data": {"items": all_sources}}
+            if assistant.analysis_status == "complete":
+                if not sources_sent:
+                    yield {"event": "sources", "data": {"items": assistant.sources or []}}
+                    sources_sent = True
                 yield {"event": "done", "data": {}}
                 return
-            left_answer = answer_historical_facts(left_context, timezone_name)
-            right_answer = answer_historical_facts(right_context, timezone_name)
-            yield from finish_with_text(left_answer + "\n\n" + right_answer, history)
-            return
 
-        if primary_window:
-            yield {"event": "working_note", "data": {"text": "Retrieving the requested historical window from your database."}}
-            context = historical_context(db, primary_window, include_memories=is_analytical_history_question(message))
-            history = history_sources(context)
-            if is_analytical_history_question(message):
-                yield {"event": "working_note", "data": {"text": "Analyzing the grounded historical context before drafting the answer."}}
-                if not context_has_data(context):
-                    yield from finish_with_text(f"I could not find enough grounded data to analyze {context.window.label}.", history)
-                    return
-                fallback = fallback_historical_analysis(message, context, timezone_name)
-                full_answer = yield from stream_llm_answer(
-                    historical_analysis_messages(message, context),
-                    temperature=0.1,
-                    fallback_text=fallback,
-                )
-                all_sources = prefix_sources + history
-                persist_assistant_turn(db, session, full_answer, all_sources)
-                yield {"event": "sources", "data": {"items": all_sources}}
-                yield {"event": "done", "data": {}}
+            if assistant.analysis_status == "error":
+                error_message = assistant.analysis_error or assistant.content or "Streaming failed."
+                if assistant.content and assistant.content.startswith(last_content) and len(assistant.content) > len(last_content):
+                    delta = assistant.content[len(last_content):]
+                    if not answer_started:
+                        yield {"event": "answer_start", "data": {}}
+                        answer_started = True
+                    last_content = assistant.content
+                    yield {"event": "answer_delta", "data": {"text": delta}}
+                yield {"event": "error", "data": {"message": error_message}}
                 return
-            yield from finish_with_text(answer_historical_facts(context, timezone_name), history)
-            return
-
-        yield {"event": "working_note", "data": {"text": "Retrieving relevant memories, recent context, and open loops."}}
-        semantic = semantic_search(db, message, limit=6)
-        context = recent_context(db)
-        context["open_time_items"] = [
-            time_item_to_card_item(item)
-            for item in db.query(TimeItem).filter(TimeItem.status.in_(("open", "snoozed"))).order_by(TimeItem.due_at).limit(20).all()
-        ]
-        payload = {"semantic_matches": semantic, "recent_context": context}
-        yield {"event": "working_note", "data": {"text": "Drafting the final answer from your local context."}}
-        if semantic:
-            fallback = "I found related local context, but Ollama is not reachable yet:\n" + "\n".join(
-                f"- {item['content']}" for item in semantic[:4]
-            )
-        else:
-            fallback = "I do not have enough local context yet, and Ollama is not reachable. Add logs or start Ollama, then ask again."
-        full_answer = yield from stream_llm_answer(
-            semantic_answer_messages(message, payload),
-            temperature=0.2,
-            fallback_text=fallback,
-        )
-        all_sources = prefix_sources + semantic
-        persist_assistant_turn(db, session, full_answer, all_sources)
-        yield {"event": "sources", "data": {"items": all_sources}}
-        yield {"event": "done", "data": {}}
-    except Exception as exc:
-        db.rollback()
-        yield {"event": "error", "data": {"message": str(exc)}}
+        finally:
+            poll_db.close()
+        clock.sleep(0.25)
 
 
 def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
