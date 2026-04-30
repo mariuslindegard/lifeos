@@ -21,6 +21,169 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function sanitizeUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^(https?:|mailto:|tel:|\/|#)/i.test(raw)) {
+    return raw.replaceAll('"', "%22");
+  }
+  return "";
+}
+
+function parseInlineMarkdown(value) {
+  let html = escapeHtml(value);
+  const tokens = [];
+  html = html.replace(/`([^`\n]+)`/g, (_match, code) => {
+    const token = `@@CODE${tokens.length}@@`;
+    tokens.push(`<code>${code}</code>`);
+    return token;
+  });
+  html = html.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_match, alt, url, title) => {
+    const safeUrl = sanitizeUrl(url);
+    if (!safeUrl) return escapeHtml(_match);
+    const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+    return `<img src="${safeUrl}" alt="${escapeHtml(alt)}"${titleAttr}>`;
+  });
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_match, label, url, title) => {
+    const safeUrl = sanitizeUrl(url);
+    if (!safeUrl) return escapeHtml(_match);
+    const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+    const external = /^(https?:|mailto:|tel:)/i.test(safeUrl) ? ' target="_blank" rel="noreferrer"' : "";
+    return `<a href="${safeUrl}"${titleAttr}${external}>${label}</a>`;
+  });
+  html = html.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  html = html.replace(/___([^_]+)___/g, "<strong><em>$1</em></strong>");
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  html = html.replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  html = html.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
+  html = html.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  for (let index = 0; index < tokens.length; index += 1) {
+    html = html.replace(`@@CODE${index}@@`, tokens[index]);
+  }
+  return html;
+}
+
+function splitTableRow(line) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdown(source) {
+  const text = String(source || "").replace(/\r\n?/g, "\n");
+  const lines = text.split("\n");
+  const blocks = [];
+  let index = 0;
+
+  const isTableDivider = (line) => /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(line.trim());
+  const isTableRow = (line) => line.includes("|");
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+    const fenceMatch = trimmed.match(/^```(\w+)?\s*$/);
+    if (fenceMatch) {
+      index += 1;
+      const codeLines = [];
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) {
+        index += 1;
+      }
+      const language = fenceMatch[1] ? ` class="language-${escapeHtml(fenceMatch[1])}"` : "";
+      blocks.push(`<pre><code${language}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      continue;
+    }
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      blocks.push(`<h${level}>${parseInlineMarkdown(headingMatch[2])}</h${level}>`);
+      index += 1;
+      continue;
+    }
+    if (/^([-*_])(?:\s*\1){2,}\s*$/.test(trimmed)) {
+      blocks.push("<hr>");
+      index += 1;
+      continue;
+    }
+    if (isTableRow(trimmed) && index + 1 < lines.length && isTableDivider(lines[index + 1])) {
+      const headers = splitTableRow(lines[index]);
+      index += 2;
+      const rows = [];
+      while (index < lines.length && lines[index].trim() && isTableRow(lines[index])) {
+        rows.push(splitTableRow(lines[index]));
+        index += 1;
+      }
+      const head = headers.map((cell) => `<th>${parseInlineMarkdown(cell)}</th>`).join("");
+      const body = rows
+        .map((row) => `<tr>${row.map((cell) => `<td>${parseInlineMarkdown(cell)}</td>`).join("")}</tr>`)
+        .join("");
+      blocks.push(`<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`);
+      continue;
+    }
+    if (/^>\s?/.test(trimmed)) {
+      const quoteLines = [];
+      while (index < lines.length && /^>\s?/.test(lines[index].trim())) {
+        quoteLines.push(lines[index].trim().replace(/^>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
+      continue;
+    }
+    if (/^[-+*]\s+/.test(trimmed)) {
+      const items = [];
+      while (index < lines.length && /^[-+*]\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^[-+*]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(`<ul>${items.map((item) => `<li>${parseInlineMarkdown(item)}</li>`).join("")}</ul>`);
+      continue;
+    }
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items = [];
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^\d+\.\s+/, ""));
+        index += 1;
+      }
+      blocks.push(`<ol>${items.map((item) => `<li>${parseInlineMarkdown(item)}</li>`).join("")}</ol>`);
+      continue;
+    }
+    const paragraphLines = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^```/.test(lines[index].trim()) &&
+      !/^(#{1,6})\s+/.test(lines[index].trim()) &&
+      !/^>\s?/.test(lines[index].trim()) &&
+      !/^[-+*]\s+/.test(lines[index].trim()) &&
+      !/^\d+\.\s+/.test(lines[index].trim()) &&
+      !/^([-*_])(?:\s*\1){2,}\s*$/.test(lines[index].trim()) &&
+      !(isTableRow(lines[index].trim()) && index + 1 < lines.length && isTableDivider(lines[index + 1]))
+    ) {
+      paragraphLines.push(lines[index].trim());
+      index += 1;
+    }
+    blocks.push(`<p>${parseInlineMarkdown(paragraphLines.join(" "))}</p>`);
+  }
+
+  return blocks.join("");
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -579,32 +742,37 @@ async function connectToRunningSession(message) {
           if (!workingNode.classList.contains("assistant")) {
             workingNode.classList.add("assistant");
           }
+          setMessageMarkdown(workingNode, false);
           if (!message.content) {
-            workingNode.textContent = "";
+            setMessageContent(workingNode, "");
           }
         }
         if (!workingNode) {
-          workingNode = addMessage("assistant", "", true);
+          workingNode = addMessage("assistant", "", true, "", { markdown: false });
         }
         answerStarted = true;
         return;
       }
       if (eventName === "answer_delta") {
         if (!workingNode) {
-          workingNode = addMessage("assistant", "", true);
+          workingNode = addMessage("assistant", "", true, "", { markdown: false });
         }
         if (workingNode.classList.contains("working-note")) {
           workingNode.classList.remove("working-note");
           if (!answerStarted) {
-            workingNode.textContent = "";
+            setMessageContent(workingNode, "");
           }
         }
         answerStarted = true;
-        workingNode.textContent += payload.text || "";
+        appendMessageContent(workingNode, payload.text || "");
         scrollChatToLatest();
         return;
       }
-      if (eventName === "done" || eventName === "error") {
+      if (eventName === "done") {
+        setMessageMarkdown(workingNode, true);
+        stopSessionStream();
+      }
+      if (eventName === "error") {
         stopSessionStream();
       }
     });
@@ -629,7 +797,9 @@ function renderChatHistory(messages) {
         ? message.metadata?.thinking || message.metadata?.working_note || "Working..."
         : message.content;
     const extraClass = isRunningAssistant && !message.content ? "working-note" : "";
-    addMessage(message.role === "assistant" ? "assistant" : "user", text, false, extraClass);
+    addMessage(message.role === "assistant" ? "assistant" : "user", text, false, extraClass, {
+      markdown: message.role === "assistant" && message.analysis_status !== "running",
+    });
     state.sessionId = message.session_id || state.sessionId;
   }
   const running = runningAssistantMessage(messages || []);
@@ -646,13 +816,40 @@ function renderChatHistory(messages) {
   scrollChatToLatest();
 }
 
-function addMessage(role, text, scroll = true, extraClass = "") {
-  const node = document.createElement("div");
+function shouldRenderMarkdown(node) {
+  return node.classList.contains("assistant") && node.dataset.markdown === "true";
+}
+
+function setMessageContent(node, text) {
+  if (!node) return;
+  const rawText = String(text || "");
+  node.dataset.rawText = rawText;
+  if (shouldRenderMarkdown(node)) {
+    node.innerHTML = `<div class="markdown-body">${renderMarkdown(rawText)}</div>`;
+    return;
+  }
+  node.textContent = rawText;
+}
+
+function appendMessageContent(node, text) {
+  if (!node) return;
+  setMessageContent(node, `${node.dataset.rawText || ""}${text || ""}`);
+}
+
+function setMessageMarkdown(node, active) {
+  if (!node) return;
+  node.dataset.markdown = active ? "true" : "false";
+  setMessageContent(node, node.dataset.rawText || "");
+}
+
+function addMessage(role, text, scroll = true, extraClass = "", options = {}) {
+  const node = document.createElement("article");
   node.className = `message ${role}`;
   if (extraClass) {
     node.classList.add(extraClass);
   }
-  node.textContent = text;
+  node.dataset.markdown = options.markdown ? "true" : "false";
+  setMessageContent(node, text);
   $("#chatMessages").appendChild(node);
   if (scroll) {
     scrollChatToLatest();
@@ -662,7 +859,7 @@ function addMessage(role, text, scroll = true, extraClass = "") {
 
 function setMessageText(node, text) {
   if (!node) return;
-  node.textContent = text;
+  setMessageContent(node, text);
   scrollChatToLatest();
 }
 
@@ -856,7 +1053,7 @@ async function streamChatResponse(message) {
       removeMessage(workingNode);
       workingNode = null;
       if (!answerNode) {
-        answerNode = addMessage("assistant", "", true);
+        answerNode = addMessage("assistant", "", true, "", { markdown: false });
       }
       if (state.runningAssistantMessage) {
         state.runningAssistantMessage.content = "";
@@ -867,9 +1064,9 @@ async function streamChatResponse(message) {
       if (!answerNode) {
         removeMessage(workingNode);
         workingNode = null;
-        answerNode = addMessage("assistant", "", true);
+        answerNode = addMessage("assistant", "", true, "", { markdown: false });
       }
-      answerNode.textContent += payload.text || "";
+      appendMessageContent(answerNode, payload.text || "");
       if (state.runningAssistantMessage) {
         state.runningAssistantMessage.content += payload.text || "";
       }
@@ -881,7 +1078,7 @@ async function streamChatResponse(message) {
       removeMessage(workingNode);
       workingNode = null;
       if (!answerNode) {
-        answerNode = addMessage("assistant", terminalError, true);
+        answerNode = addMessage("assistant", terminalError, true, "", { markdown: false });
       } else {
         setMessageText(answerNode, terminalError);
       }
@@ -889,6 +1086,7 @@ async function streamChatResponse(message) {
       return;
     }
     if (eventName === "done") {
+      setMessageMarkdown(answerNode, true);
       state.runningAssistantMessage = null;
     }
   }
