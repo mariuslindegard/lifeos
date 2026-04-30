@@ -528,4 +528,4 @@ def test_frontend_markup_and_assets_match_new_shell() -> None:
     assert "persona-layout" in css
     assert "history-section" in css
     assert "brief-grid" not in css
-    assert 'CACHE_NAME = "lifeos-v10"' in sw
+    assert 'CACHE_NAME = "lifeos-v11"' in sw

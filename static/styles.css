@@ -537,6 +537,16 @@ h3 {
       linear-gradient(180deg, rgba(24, 20, 18, 0.96) 0%, rgba(24, 20, 18, 0.82) 75%, rgba(24, 20, 18, 0) 100%);
     backdrop-filter: blur(14px);
   }
+
+  .app-view.keyboard-open {
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+  }
+
+  .app-view.keyboard-open .bottom-nav {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-50%) translateY(18px);
+  }
 }
 
 .nav-button {

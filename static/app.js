@@ -68,6 +68,10 @@ function showApp() {
   setScreen(state.activeScreen);
 }
 
+function setKeyboardOpen(active) {
+  $("#appView").classList.toggle("keyboard-open", Boolean(active));
+}
+
 function screenScroller(screen = state.activeScreen) {
   if (screen === "overview") return $("#overviewContent");
   if (screen === "chat") return $("#chatMessages");
@@ -448,10 +452,15 @@ function renderPersona(data) {
 
 function renderChatHistory(messages) {
   const chat = $("#chatMessages");
+  const chatHidden = $("#chatView").hidden;
   chat.innerHTML = "";
   for (const message of messages || []) {
     addMessage(message.role === "assistant" ? "assistant" : "user", message.content, false);
     state.sessionId = message.session_id || state.sessionId;
+  }
+  if (chatHidden) {
+    state.screenScroll.chat = null;
+    return;
   }
   scrollChatToLatest();
 }
@@ -535,6 +544,9 @@ function setScreen(screen) {
   $("#overviewNavButton").classList.toggle("active", state.activeScreen === "overview");
   $("#chatNavButton").classList.toggle("active", state.activeScreen === "chat");
   $("#personaNavButton").classList.toggle("active", state.activeScreen === "persona");
+  if (state.activeScreen !== "chat") {
+    setKeyboardOpen(false);
+  }
   restoreScreenScroll();
 }
 
@@ -728,6 +740,8 @@ $("#chatNavButton").addEventListener("click", () => setScreen("chat"));
 $("#personaNavButton").addEventListener("click", () => setScreen("persona"));
 $("#historyButton").addEventListener("click", () => openHistory());
 $("#newChatButton").addEventListener("click", () => startNewChat());
+$("#chatInput").addEventListener("focus", () => setKeyboardOpen(true));
+$("#chatInput").addEventListener("blur", () => setKeyboardOpen(false));
 
 $("#overviewContent").addEventListener("scroll", () => saveScreenScroll("overview"));
 $("#chatMessages").addEventListener("scroll", () => saveScreenScroll("chat"));

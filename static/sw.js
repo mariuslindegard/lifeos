@@ -1,4 +1,4 @@
-const CACHE_NAME = "lifeos-v10";
+const CACHE_NAME = "lifeos-v11";
 const APP_SHELL = [
   "/",
   "/static/styles.css",
