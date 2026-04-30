@@ -2,6 +2,7 @@ const state = {
   authed: false,
   activeScreen: "overview",
   sessionId: null,
+  draftChat: false,
   overview: null,
   persona: null,
   historySessions: [],
@@ -585,6 +586,7 @@ function closeHistory() {
 
 async function loadChatSession(sessionId) {
   const history = await api(`/api/chat/history?session_id=${sessionId}`);
+  state.draftChat = false;
   state.sessionId = history.session.id;
   renderChatHistory(history.messages || []);
   closeHistory();
@@ -604,7 +606,13 @@ function setScreen(screen) {
     setKeyboardOpen(false);
   }
   restoreScreenScroll();
-  if (state.activeScreen === "chat" && !state.chatStreaming && !state.sessionId && !$("#chatMessages").childElementCount) {
+  if (
+    state.activeScreen === "chat" &&
+    !state.chatStreaming &&
+    !state.sessionId &&
+    !state.draftChat &&
+    !$("#chatMessages").childElementCount
+  ) {
     void loadLatestChatSession();
   }
 }
@@ -619,6 +627,7 @@ async function loadLatestChatSession() {
   const sessions = await api("/api/chat/history");
   state.historySessions = sessions.sessions || [];
   if (!state.historySessions.length) {
+    state.draftChat = false;
     $("#chatMessages").innerHTML = "";
     state.sessionId = null;
     state.screenScroll.chat = 0;
@@ -627,6 +636,7 @@ async function loadLatestChatSession() {
   }
   const latest = state.historySessions[0];
   const history = await api(`/api/chat/history?session_id=${latest.id}`);
+  state.draftChat = false;
   state.sessionId = history.session.id;
   renderChatHistory(history.messages || []);
 }
@@ -660,6 +670,7 @@ async function streamChatResponse(message) {
 
   function handleStreamEvent(eventName, payload) {
     if (eventName === "session") {
+      state.draftChat = false;
       state.sessionId = payload.session_id || state.sessionId;
       return;
     }
@@ -755,6 +766,7 @@ async function streamChatResponse(message) {
 
 function startNewChat() {
   stopSessionPolling();
+  state.draftChat = true;
   state.sessionId = null;
   state.screenScroll.chat = 0;
   $("#chatMessages").innerHTML = "";
