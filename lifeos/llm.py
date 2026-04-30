@@ -35,6 +35,17 @@ def _message_content(value: Any) -> str:
     return str(content or "")
 
 
+def _message_thinking(value: Any) -> str:
+    payload = _mapping_or_dump(value)
+    if payload:
+        message = payload.get("message")
+        if isinstance(message, dict):
+            return str(message.get("thinking") or "")
+    message = getattr(value, "message", None)
+    thinking = getattr(message, "thinking", None)
+    return str(thinking or "")
+
+
 def _embedding_vector(value: Any) -> list[float]:
     payload = _mapping_or_dump(value)
     if isinstance(payload.get("embedding"), list):
@@ -56,17 +67,30 @@ class OllamaClient:
         return _message_content(response)
 
     def chat_stream(self, messages: list[dict[str, str]], *, temperature: float = 0.2) -> Iterator[str]:
+        for chunk in self.chat_stream_events(messages, temperature=temperature):
+            content = str(chunk.get("content") or "")
+            if content:
+                yield content
+
+    def chat_stream_events(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        think: bool = True,
+    ) -> Iterator[dict[str, str]]:
         response = self.client.chat(
             model=settings.ollama_model,
             messages=messages,
             stream=True,
-            think=False,
+            think=think,
             options={"temperature": temperature},
         )
         for chunk in response:
+            thinking = _message_thinking(chunk)
             content = _message_content(chunk)
-            if content:
-                yield content
+            if thinking or content:
+                yield {"thinking": thinking, "content": content}
 
     def embed(self, text: str) -> list[float]:
         response = self.client.embeddings(model=settings.ollama_embed_model, prompt=text)

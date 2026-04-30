@@ -1881,7 +1881,13 @@ def stream_chat_turn_events(
             for chunk in stream_text_chunks(prefix_text):
                 yield {"event": "answer_delta", "data": {"text": chunk}}
         try:
-            for content_text in get_llm().chat_stream(messages, temperature=temperature):
+            for delta in get_llm().chat_stream_events(messages, temperature=temperature, think=True):
+                thinking_text = str(delta.get("thinking") or "")
+                if thinking_text and not started:
+                    yield {"event": "thinking_delta", "data": {"text": thinking_text}}
+                content_text = str(delta.get("content") or "")
+                if not content_text:
+                    continue
                 if not started:
                     yield {"event": "answer_start", "data": {}}
                     started = True
