@@ -1,8 +1,8 @@
-const CACHE_NAME = "lifeos-v11";
+const CACHE_NAME = "lifeos-v12";
 const APP_SHELL = [
   "/",
-  "/static/styles.css",
-  "/static/app.js",
+  "/static/styles.css?v=12",
+  "/static/app.js?v=12",
   "/static/icon.svg",
   "/manifest.webmanifest",
 ];

@@ -3,6 +3,7 @@ const state = {
   activeScreen: "overview",
   sessionId: null,
   draftChat: false,
+  chatLoadToken: 0,
   overview: null,
   persona: null,
   historySessions: [],
@@ -585,7 +586,10 @@ function closeHistory() {
 }
 
 async function loadChatSession(sessionId) {
+  const loadToken = state.chatLoadToken + 1;
+  state.chatLoadToken = loadToken;
   const history = await api(`/api/chat/history?session_id=${sessionId}`);
+  if (loadToken !== state.chatLoadToken) return;
   state.draftChat = false;
   state.sessionId = history.session.id;
   renderChatHistory(history.messages || []);
@@ -624,7 +628,10 @@ async function refreshAppData() {
 }
 
 async function loadLatestChatSession() {
+  const loadToken = state.chatLoadToken + 1;
+  state.chatLoadToken = loadToken;
   const sessions = await api("/api/chat/history");
+  if (loadToken !== state.chatLoadToken) return;
   state.historySessions = sessions.sessions || [];
   if (!state.historySessions.length) {
     state.draftChat = false;
@@ -636,6 +643,7 @@ async function loadLatestChatSession() {
   }
   const latest = state.historySessions[0];
   const history = await api(`/api/chat/history?session_id=${latest.id}`);
+  if (loadToken !== state.chatLoadToken) return;
   state.draftChat = false;
   state.sessionId = history.session.id;
   renderChatHistory(history.messages || []);
@@ -766,6 +774,7 @@ async function streamChatResponse(message) {
 
 function startNewChat() {
   stopSessionPolling();
+  state.chatLoadToken += 1;
   state.draftChat = true;
   state.sessionId = null;
   state.screenScroll.chat = 0;
