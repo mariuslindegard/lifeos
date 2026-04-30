@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import re
+from collections.abc import Iterator
 from typing import Any
 
 import ollama
@@ -24,6 +25,24 @@ class OllamaClient:
             options={"temperature": temperature},
         )
         return response["message"]["content"]
+
+    def chat_stream(self, messages: list[dict[str, str]], *, temperature: float = 0.2) -> Iterator[str]:
+        response = self.client.chat(
+            model=settings.ollama_model,
+            messages=messages,
+            stream=True,
+            think=False,
+            options={"temperature": temperature},
+        )
+        for chunk in response:
+            if not isinstance(chunk, dict):
+                continue
+            message = chunk.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = str(message.get("content") or "")
+            if content:
+                yield content
 
     def embed(self, text: str) -> list[float]:
         response = self.client.embeddings(model=settings.ollama_embed_model, prompt=text)

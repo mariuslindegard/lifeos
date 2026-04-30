@@ -709,7 +709,12 @@ def add_chat_message(
     return message
 
 
-def record_chat_turn(db: Session, message: str, *, session_id: int | None = None) -> tuple[str, list[dict], int]:
+def prepare_chat_turn(
+    db: Session,
+    message: str,
+    *,
+    session_id: int | None = None,
+) -> tuple[ChatSession, ChatMessage, list[TimeItem]]:
     session = get_or_create_chat_session(db, session_id=session_id)
     user_message = add_chat_message(db, session=session, role="user", content=message)
     if is_persona_relevant(message):
@@ -723,14 +728,34 @@ def record_chat_turn(db: Session, message: str, *, session_id: int | None = None
         source_id=user_message.id,
     ):
         created_items.append(add_time_item(db, **item))
-    answer, sources = answer_chat(db, message)
-    if created_items:
-        item_lines = "\n".join(f"- {item.kind}: {item.title}" for item in created_items)
-        answer = f"Added to Daily Execution:\n{item_lines}\n\n{answer}"
-        sources = [{"type": "time_item", "id": item.id, "kind": item.kind, "title": item.title} for item in created_items] + sources
+    db.commit()
+    db.refresh(session)
+    db.refresh(user_message)
+    return session, user_message, created_items
+
+
+def created_item_prefix(created_items: list[TimeItem]) -> tuple[str, list[dict[str, Any]]]:
+    if not created_items:
+        return "", []
+    item_lines = "\n".join(f"- {item.kind}: {item.title}" for item in created_items)
+    prefix = f"Added to Daily Execution:\n{item_lines}\n\n"
+    sources = [{"type": "time_item", "id": item.id, "kind": item.kind, "title": item.title} for item in created_items]
+    return prefix, sources
+
+
+def persist_assistant_turn(db: Session, session: ChatSession, answer: str, sources: list[dict[str, Any]]) -> None:
     add_chat_message(db, session=session, role="assistant", content=answer, sources=sources)
     db.commit()
     refresh_overview_card(db)
+
+
+def record_chat_turn(db: Session, message: str, *, session_id: int | None = None) -> tuple[str, list[dict], int]:
+    session, _user_message, created_items = prepare_chat_turn(db, message, session_id=session_id)
+    answer, sources = answer_chat(db, message)
+    prefix, prefix_sources = created_item_prefix(created_items)
+    answer = prefix + answer
+    sources = prefix_sources + sources
+    persist_assistant_turn(db, session, answer, sources)
     return answer, sources, session.id
 
 
@@ -1752,6 +1777,54 @@ def fallback_historical_analysis(
     return lead + " The window is sparse, so any analysis would be low confidence."
 
 
+def historical_analysis_messages(
+    message: str,
+    context: HistoricalContext,
+    *,
+    comparison: HistoricalContext | None = None,
+) -> list[dict[str, str]]:
+    payload = {"primary": historical_context_payload(context)}
+    if comparison:
+        payload["comparison"] = historical_context_payload(comparison)
+    system = (
+        "You are LifeOS, a local personal assistant. Analyze only the supplied historical database context. "
+        "Ground every claim in the evidence. If the window is sparse, say so. "
+        "For factual references, do not invent missing events."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Historical context:\n{payload}\n\nQuestion:\n{message}"},
+    ]
+
+
+def semantic_answer_messages(message: str, payload: dict[str, Any]) -> list[dict[str, str]]:
+    system = (
+        "You are LifeOS, a local personal assistant. Answer using the supplied database context. "
+        "If a factual question requires dates or exact history and the context is insufficient, say what data is missing. "
+        "Be practical and concise. Avoid medical diagnosis; frame health advice as patterns to test."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Database context:\n{payload}\n\nQuestion:\n{message}"},
+    ]
+
+
+def stream_text_chunks(text: str, *, chunk_size: int = 160) -> list[str]:
+    if not text:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        if end < len(text):
+            split = text.rfind(" ", start, end)
+            if split > start + 20:
+                end = split + 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
 def answer_historical_analysis(
     db: Session,
     message: str,
@@ -1762,24 +1835,165 @@ def answer_historical_analysis(
 ) -> str:
     if not context_has_data(context) and not (comparison and context_has_data(comparison)):
         return f"I could not find enough grounded data to analyze {context.window.label}."
-    payload = {"primary": historical_context_payload(context)}
-    if comparison:
-        payload["comparison"] = historical_context_payload(comparison)
-    system = (
-        "You are LifeOS, a local personal assistant. Analyze only the supplied historical database context. "
-        "Ground every claim in the evidence. If the window is sparse, say so. "
-        "For factual references, do not invent missing events."
-    )
     try:
-        return get_llm().chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Historical context:\n{payload}\n\nQuestion:\n{message}"},
-            ],
-            temperature=0.1,
-        )
+        return get_llm().chat(historical_analysis_messages(message, context, comparison=comparison), temperature=0.1)
     except Exception:
         return fallback_historical_analysis(message, context, timezone_name, comparison=comparison)
+
+
+def stream_chat_turn_events(
+    db: Session,
+    message: str,
+    *,
+    session_id: int | None = None,
+) -> Any:
+    session, _user_message, created_items = prepare_chat_turn(db, message, session_id=session_id)
+    yield {"event": "session", "data": {"session_id": session.id}}
+    prefix_text, prefix_sources = created_item_prefix(created_items)
+    if created_items:
+        yield {
+            "event": "working_note",
+            "data": {"text": f"Captured {len(created_items)} time item{'s' if len(created_items) != 1 else ''} while I work on the reply."},
+        }
+
+    def finish_with_text(answer_text: str, extra_sources: list[dict[str, Any]]) -> Any:
+        full_answer = prefix_text + answer_text
+        all_sources = prefix_sources + extra_sources
+        yield {"event": "answer_start", "data": {}}
+        for chunk in stream_text_chunks(full_answer):
+            yield {"event": "answer_delta", "data": {"text": chunk}}
+        persist_assistant_turn(db, session, full_answer, all_sources)
+        yield {"event": "sources", "data": {"items": all_sources}}
+        yield {"event": "done", "data": {}}
+
+    try:
+        persona = ensure_persona(db)
+        timezone_name = persona.timezone or settings.default_timezone
+        yield {
+            "event": "working_note",
+            "data": {"text": "Checking whether this is a time-based question or a general context question."},
+        }
+        comparison_windows = parse_comparison_time_windows(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
+        primary_window = parse_time_window(message, timezone_name=timezone_name) if is_temporal_query_intent(message) else None
+
+        if comparison_windows:
+            yield {"event": "working_note", "data": {"text": "Retrieving both historical windows from your database."}}
+            left_context = historical_context(db, comparison_windows[0], include_memories=is_analytical_history_question(message))
+            right_context = historical_context(db, comparison_windows[1], include_memories=is_analytical_history_question(message))
+            history = history_sources(left_context) + history_sources(right_context)
+            if is_analytical_history_question(message):
+                yield {"event": "working_note", "data": {"text": "Analyzing the grounded comparison before drafting the answer."}}
+                if not context_has_data(left_context) and not context_has_data(right_context):
+                    yield from finish_with_text(
+                        f"I could not find enough grounded data to analyze {left_context.window.label}.",
+                        history,
+                    )
+                    return
+                final_parts = [prefix_text]
+                yield {"event": "answer_start", "data": {}}
+                if prefix_text:
+                    for chunk in stream_text_chunks(prefix_text):
+                        yield {"event": "answer_delta", "data": {"text": chunk}}
+                streamed = False
+                try:
+                    for delta in get_llm().chat_stream(
+                        historical_analysis_messages(message, left_context, comparison=right_context),
+                        temperature=0.1,
+                    ):
+                        streamed = True
+                        final_parts.append(delta)
+                        yield {"event": "answer_delta", "data": {"text": delta}}
+                except Exception:
+                    fallback = fallback_historical_analysis(message, left_context, timezone_name, comparison=right_context)
+                    if not streamed:
+                        final_parts = [prefix_text, fallback]
+                        for chunk in stream_text_chunks(fallback):
+                            yield {"event": "answer_delta", "data": {"text": chunk}}
+                full_answer = "".join(final_parts)
+                all_sources = prefix_sources + history
+                persist_assistant_turn(db, session, full_answer, all_sources)
+                yield {"event": "sources", "data": {"items": all_sources}}
+                yield {"event": "done", "data": {}}
+                return
+            left_answer = answer_historical_facts(left_context, timezone_name)
+            right_answer = answer_historical_facts(right_context, timezone_name)
+            yield from finish_with_text(left_answer + "\n\n" + right_answer, history)
+            return
+
+        if primary_window:
+            yield {"event": "working_note", "data": {"text": "Retrieving the requested historical window from your database."}}
+            context = historical_context(db, primary_window, include_memories=is_analytical_history_question(message))
+            history = history_sources(context)
+            if is_analytical_history_question(message):
+                yield {"event": "working_note", "data": {"text": "Analyzing the grounded historical context before drafting the answer."}}
+                if not context_has_data(context):
+                    yield from finish_with_text(f"I could not find enough grounded data to analyze {context.window.label}.", history)
+                    return
+                final_parts = [prefix_text]
+                yield {"event": "answer_start", "data": {}}
+                if prefix_text:
+                    for chunk in stream_text_chunks(prefix_text):
+                        yield {"event": "answer_delta", "data": {"text": chunk}}
+                streamed = False
+                try:
+                    for delta in get_llm().chat_stream(historical_analysis_messages(message, context), temperature=0.1):
+                        streamed = True
+                        final_parts.append(delta)
+                        yield {"event": "answer_delta", "data": {"text": delta}}
+                except Exception:
+                    fallback = fallback_historical_analysis(message, context, timezone_name)
+                    if not streamed:
+                        final_parts = [prefix_text, fallback]
+                        for chunk in stream_text_chunks(fallback):
+                            yield {"event": "answer_delta", "data": {"text": chunk}}
+                full_answer = "".join(final_parts)
+                all_sources = prefix_sources + history
+                persist_assistant_turn(db, session, full_answer, all_sources)
+                yield {"event": "sources", "data": {"items": all_sources}}
+                yield {"event": "done", "data": {}}
+                return
+            yield from finish_with_text(answer_historical_facts(context, timezone_name), history)
+            return
+
+        yield {"event": "working_note", "data": {"text": "Retrieving relevant memories, recent context, and open loops."}}
+        semantic = semantic_search(db, message, limit=6)
+        context = recent_context(db)
+        context["open_time_items"] = [
+            time_item_to_card_item(item)
+            for item in db.query(TimeItem).filter(TimeItem.status.in_(("open", "snoozed"))).order_by(TimeItem.due_at).limit(20).all()
+        ]
+        payload = {"semantic_matches": semantic, "recent_context": context}
+        yield {"event": "working_note", "data": {"text": "Drafting the final answer from your local context."}}
+        final_parts = [prefix_text]
+        yield {"event": "answer_start", "data": {}}
+        if prefix_text:
+            for chunk in stream_text_chunks(prefix_text):
+                yield {"event": "answer_delta", "data": {"text": chunk}}
+        streamed = False
+        try:
+            for delta in get_llm().chat_stream(semantic_answer_messages(message, payload), temperature=0.2):
+                streamed = True
+                final_parts.append(delta)
+                yield {"event": "answer_delta", "data": {"text": delta}}
+        except Exception:
+            if semantic:
+                fallback = "I found related local context, but Ollama is not reachable yet:\n" + "\n".join(
+                    f"- {item['content']}" for item in semantic[:4]
+                )
+            else:
+                fallback = "I do not have enough local context yet, and Ollama is not reachable. Add logs or start Ollama, then ask again."
+            if not streamed:
+                final_parts = [prefix_text, fallback]
+                for chunk in stream_text_chunks(fallback):
+                    yield {"event": "answer_delta", "data": {"text": chunk}}
+        full_answer = "".join(final_parts)
+        all_sources = prefix_sources + semantic
+        persist_assistant_turn(db, session, full_answer, all_sources)
+        yield {"event": "sources", "data": {"items": all_sources}}
+        yield {"event": "done", "data": {}}
+    except Exception as exc:
+        db.rollback()
+        yield {"event": "error", "data": {"message": str(exc)}}
 
 
 def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
@@ -1810,20 +2024,9 @@ def answer_chat(db: Session, message: str) -> tuple[str, list[dict]]:
         for item in db.query(TimeItem).filter(TimeItem.status.in_(("open", "snoozed"))).order_by(TimeItem.due_at).limit(20).all()
     ]
     sources = semantic
-    system = (
-        "You are LifeOS, a local personal assistant. Answer using the supplied database context. "
-        "If a factual question requires dates or exact history and the context is insufficient, say what data is missing. "
-        "Be practical and concise. Avoid medical diagnosis; frame health advice as patterns to test."
-    )
     payload = {"semantic_matches": semantic, "recent_context": context}
     try:
-        answer = get_llm().chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Database context:\n{payload}\n\nQuestion:\n{message}"},
-            ],
-            temperature=0.2,
-        )
+        answer = get_llm().chat(semantic_answer_messages(message, payload), temperature=0.2)
     except Exception:
         if semantic:
             bullets = "\n".join(f"- {item['content']}" for item in semantic[:4])

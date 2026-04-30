@@ -465,6 +465,12 @@ h3 {
   border-color: rgba(212, 162, 87, 0.32);
 }
 
+.message.working-note {
+  color: var(--muted);
+  border-style: dashed;
+  background: rgba(22, 18, 16, 0.54);
+}
+
 .composer {
   position: sticky;
   bottom: calc(78px + env(safe-area-inset-bottom));

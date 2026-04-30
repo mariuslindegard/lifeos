@@ -1,5 +1,6 @@
 import os
 import tempfile
+import json
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,6 +9,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.mkdtemp()}/lifeos-test.db"
 os.environ["LIFEOS_PASSWORD"] = "test-password"
 os.environ["LIFEOS_SECRET_KEY"] = "test-secret"
 os.environ["SCHEDULER_ENABLED"] = "false"
+os.environ["LIFEOS_ENV"] = "development"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect
@@ -45,6 +47,22 @@ def clear_runtime_rows() -> None:
         db.commit()
     finally:
         db.close()
+
+
+def parse_sse_frames(raw_text: str) -> list[tuple[str, dict]]:
+    frames: list[tuple[str, dict]] = []
+    for block in raw_text.split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = "message"
+        data = "{}"
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                data = line.split(":", 1)[1].strip()
+        frames.append((event_name, json.loads(data)))
+    return frames
 
 
 def test_auth_required_and_overview_endpoint() -> None:
@@ -341,6 +359,74 @@ def test_chat_history_time_item_actions_and_message_storage_still_work(monkeypat
             db.close()
 
 
+def test_chat_stream_endpoint_emits_working_notes_then_answer_and_persists_final_message(monkeypatch) -> None:
+    monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.7, 0.1, 0.2])
+    monkeypatch.setattr(
+        "lifeos.llm.OllamaClient.chat_stream",
+        lambda self, messages, temperature=0.2: iter(["Here is ", "a streamed reply."]),
+    )
+
+    body = ""
+    with TestClient(app) as client:
+        clear_runtime_rows()
+        login(client)
+        with client.stream("POST", "/api/chat/stream", json={"message": "Summarize my current context."}) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            body = "".join(response.iter_text())
+
+        frames = parse_sse_frames(body)
+        event_names = [event for event, _payload in frames]
+        assert event_names[0] == "session"
+        assert "working_note" in event_names
+        assert event_names.index("answer_start") < event_names.index("answer_delta")
+        assert event_names[-2:] == ["sources", "done"]
+
+    db = SessionLocal()
+    try:
+        messages = db.query(ChatMessage).order_by(ChatMessage.created_at).all()
+        assert len(messages) == 2
+        assert messages[0].role == "user"
+        assert messages[1].role == "assistant"
+        assert messages[1].content == "Here is a streamed reply."
+        assert "working" not in messages[1].content.lower()
+    finally:
+        db.close()
+
+
+def test_chat_stream_supports_deterministic_history_answers_without_persisting_notes(monkeypatch) -> None:
+    monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [1.0, 0.0, 0.0])
+
+    body = ""
+    with TestClient(app) as client:
+        clear_runtime_rows()
+        login(client)
+        client.post(
+            "/api/logs",
+            json={
+                "text": "Had oats and coffee, then worked a focused block.",
+                "occurred_at": local_noon_days_ago(8).isoformat(),
+            },
+        )
+        with client.stream("POST", "/api/chat/stream", json={"message": "What did I do 8 days ago?"}) as response:
+            body = "".join(response.iter_text())
+        frames = parse_sse_frames(body)
+        event_names = [event for event, _payload in frames]
+        assert "working_note" in event_names
+        assert "answer_start" in event_names
+        answer_text = "".join(payload.get("text", "") for event, payload in frames if event == "answer_delta")
+        assert "grounded record" in answer_text.lower()
+
+    db = SessionLocal()
+    try:
+        session_messages = db.query(ChatMessage).order_by(ChatMessage.created_at).all()
+        assert len(session_messages) >= 2
+        assert all("working_note" not in str(item.metadata_ or {}) for item in session_messages)
+        assert all(item.role != "assistant" or "grounded record" in item.content.lower() for item in session_messages if item.role == "assistant")
+    finally:
+        db.close()
+
+
 def test_memory_update_increases_confidence(monkeypatch) -> None:
     monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.0, 1.0, 0.0])
     with TestClient(app):
@@ -391,10 +477,12 @@ def test_frontend_markup_and_assets_match_new_shell() -> None:
     assert 'id="cardsGrid"' not in html
     assert "function renderOverview" in js
     assert "function renderPersona" in js
+    assert "/api/chat/stream" in js
+    assert "working-note" in js
     assert "Earlier Reflections" in js
     assert "Begynn å chatte for å gi meg noe å analysere!" in js
     assert "reflection-surface" in css
     assert "persona-layout" in css
     assert "history-section" in css
     assert "brief-grid" not in css
-    assert 'CACHE_NAME = "lifeos-v8"' in sw
+    assert 'CACHE_NAME = "lifeos-v9"' in sw

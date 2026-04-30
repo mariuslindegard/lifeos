@@ -5,6 +5,7 @@ const state = {
   overview: null,
   persona: null,
   historySessions: [],
+  chatStreaming: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -407,13 +408,29 @@ function renderChatHistory(messages) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-function addMessage(role, text, scroll = true) {
+function addMessage(role, text, scroll = true, extraClass = "") {
   const node = document.createElement("div");
   node.className = `message ${role}`;
+  if (extraClass) {
+    node.classList.add(extraClass);
+  }
   node.textContent = text;
   $("#chatMessages").appendChild(node);
   if (scroll) {
     $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+  }
+  return node;
+}
+
+function setMessageText(node, text) {
+  if (!node) return;
+  node.textContent = text;
+  $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+}
+
+function removeMessage(node) {
+  if (node?.parentNode) {
+    node.parentNode.removeChild(node);
   }
 }
 
@@ -490,6 +507,106 @@ async function loadLatestChatSession() {
   renderChatHistory(history.messages || []);
 }
 
+async function streamChatResponse(message) {
+  const response = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ message, session_id: state.sessionId }),
+  });
+  if (response.status === 401) {
+    showLogin();
+    throw new Error("Authentication required");
+  }
+  if (!response.ok || !response.body) {
+    let detail = {};
+    try {
+      detail = await response.json();
+    } catch {}
+    throw new Error(detail.detail || `Request failed: ${response.status}`);
+  }
+
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  let buffer = "";
+  let workingNode = addMessage("assistant", "Working...", true, "working-note");
+  let answerNode = null;
+  let terminalError = null;
+
+  function handleStreamEvent(eventName, payload) {
+    if (eventName === "session") {
+      state.sessionId = payload.session_id || state.sessionId;
+      return;
+    }
+    if (eventName === "working_note") {
+      if (!workingNode) {
+        workingNode = addMessage("assistant", "", true, "working-note");
+      }
+      setMessageText(workingNode, payload.text || "Working...");
+      return;
+    }
+    if (eventName === "answer_start") {
+      removeMessage(workingNode);
+      workingNode = null;
+      if (!answerNode) {
+        answerNode = addMessage("assistant", "", true);
+      }
+      return;
+    }
+    if (eventName === "answer_delta") {
+      if (!answerNode) {
+        removeMessage(workingNode);
+        workingNode = null;
+        answerNode = addMessage("assistant", "", true);
+      }
+      answerNode.textContent += payload.text || "";
+      $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+      return;
+    }
+    if (eventName === "error") {
+      terminalError = payload.message || "Streaming failed.";
+      removeMessage(workingNode);
+      workingNode = null;
+      if (!answerNode) {
+        answerNode = addMessage("assistant", terminalError, true);
+      } else {
+        setMessageText(answerNode, terminalError);
+      }
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const lines = frame.split("\n");
+      let eventName = "message";
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      }
+      if (dataLines.length) {
+        const payload = JSON.parse(dataLines.join("\n"));
+        handleStreamEvent(eventName, payload);
+      }
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) {
+      break;
+    }
+  }
+  if (terminalError) {
+    throw new Error(terminalError);
+  }
+}
+
 async function boot() {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -532,22 +649,23 @@ $("#chatForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = event.submitter;
   const message = $("#chatInput").value.trim();
-  if (!message) return;
+  if (!message || state.chatStreaming) return;
   $("#chatInput").value = "";
   addMessage("user", message);
+  state.chatStreaming = true;
   button.disabled = true;
+  $("#chatInput").disabled = true;
   try {
-    const response = await api("/api/chat", {
-      method: "POST",
-      body: JSON.stringify({ message, session_id: state.sessionId }),
-    });
-    state.sessionId = response.session_id || state.sessionId;
-    addMessage("assistant", response.answer);
+    await streamChatResponse(message);
     await refreshAppData();
   } catch (error) {
-    addMessage("assistant", error.message);
+    if (!String(error.message || "").trim()) {
+      addMessage("assistant", "Streaming failed.");
+    }
   } finally {
+    state.chatStreaming = false;
     button.disabled = false;
+    $("#chatInput").disabled = false;
   }
 });
 

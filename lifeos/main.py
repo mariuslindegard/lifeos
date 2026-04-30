@@ -1,9 +1,10 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
@@ -20,10 +21,11 @@ from lifeos.agent import (
     record_chat_turn,
     refresh_overview_card,
     run_job,
+    stream_chat_turn_events,
 )
 from lifeos.auth import clear_session_cookie, require_user, set_session_cookie, verify_password
 from lifeos.config import settings
-from lifeos.db import get_db, init_db
+from lifeos.db import SessionLocal, get_db, init_db
 from lifeos.llm import wait_for_ollama_ready
 from lifeos.models import AgentRun, ChatMessage, ChatSession, DashboardCard, ReflectionSummary, TimeItem
 from lifeos.schemas import ChatRequest, ChatResponse, LoginRequest, PersonaStableProfileUpdate, RawEntryCreate, RawEntryOut, SnoozeRequest
@@ -289,6 +291,27 @@ def chat_history(session_id: int | None = None, db: Session = Depends(get_db), _
 def chat(payload: ChatRequest, db: Session = Depends(get_db), _user=Depends(require_user)) -> ChatResponse:
     answer, sources, session_id = record_chat_turn(db, payload.message, session_id=payload.session_id)
     return ChatResponse(answer=answer, session_id=session_id, sources=sources)
+
+
+def sse_frame(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/api/chat/stream")
+def chat_stream(payload: ChatRequest, _user=Depends(require_user)) -> StreamingResponse:
+    def event_stream():
+        db = SessionLocal()
+        try:
+            for event in stream_chat_turn_events(db, payload.message, session_id=payload.session_id):
+                yield sse_frame(str(event["event"]), event.get("data", {}))
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/agent/run/{job_name}")
