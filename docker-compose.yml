@@ -43,7 +43,6 @@ services:
 
   ollama:
     image: ollama/ollama:latest
-    profiles: ["ollama"]
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 5s
@@ -58,7 +57,6 @@ services:
 
   ollama-pull:
     image: ollama/ollama:latest
-    profiles: ["ollama"]
     depends_on:
       ollama:
         condition: service_healthy
