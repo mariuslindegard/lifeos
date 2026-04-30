@@ -659,9 +659,7 @@ $("#chatForm").addEventListener("submit", async (event) => {
     await streamChatResponse(message);
     await refreshAppData();
   } catch (error) {
-    if (!String(error.message || "").trim()) {
-      addMessage("assistant", "Streaming failed.");
-    }
+    addMessage("assistant", String(error.message || "Streaming failed."));
   } finally {
     state.chatStreaming = false;
     button.disabled = false;

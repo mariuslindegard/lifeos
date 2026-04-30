@@ -10,12 +10,15 @@ os.environ["LIFEOS_PASSWORD"] = "test-password"
 os.environ["LIFEOS_SECRET_KEY"] = "test-secret"
 os.environ["SCHEDULER_ENABLED"] = "false"
 os.environ["LIFEOS_ENV"] = "development"
+os.environ["OLLAMA_BASE_URL"] = "http://127.0.0.1:1"
 
 from fastapi.testclient import TestClient
+from ollama import _types as ollama_types
 from sqlalchemy import inspect
 
 from lifeos.agent import add_memory, latest_completed_local_day
 from lifeos.db import SessionLocal, engine
+from lifeos.llm import OllamaClient
 from lifeos.main import app
 from lifeos.models import AgentRun, ChatMessage, ChatSession, DashboardCard, ExtractedEvent, Memory, RawEntry, ReflectionSummary, TimeItem
 from lifeos.rag import parse_time_window
@@ -63,6 +66,21 @@ def parse_sse_frames(raw_text: str) -> list[tuple[str, dict]]:
                 data = line.split(":", 1)[1].strip()
         frames.append((event_name, json.loads(data)))
     return frames
+
+
+def test_ollama_stream_reader_supports_typed_chat_response_objects() -> None:
+    client = OllamaClient()
+
+    def fake_chat(**_kwargs):
+        return iter(
+            [
+                ollama_types.ChatResponse(message=ollama_types.Message(role="assistant", content="Hello ")),
+                ollama_types.ChatResponse(message=ollama_types.Message(role="assistant", content="world")),
+            ]
+        )
+
+    client.client.chat = fake_chat
+    assert "".join(client.chat_stream([{"role": "user", "content": "Hi"}])) == "Hello world"
 
 
 def test_auth_required_and_overview_endpoint() -> None:

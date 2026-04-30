@@ -1,8 +1,8 @@
 import hashlib
 import json
 import logging
-import time
 import re
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -12,6 +12,35 @@ from lifeos.config import settings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _mapping_or_dump(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return {}
+
+
+def _message_content(value: Any) -> str:
+    payload = _mapping_or_dump(value)
+    if payload:
+        message = payload.get("message")
+        if isinstance(message, dict):
+            return str(message.get("content") or "")
+    message = getattr(value, "message", None)
+    content = getattr(message, "content", None)
+    return str(content or "")
+
+
+def _embedding_vector(value: Any) -> list[float]:
+    payload = _mapping_or_dump(value)
+    if isinstance(payload.get("embedding"), list):
+        return payload["embedding"]
+    embedding = getattr(value, "embedding", None)
+    return embedding if isinstance(embedding, list) else []
 
 
 class OllamaClient:
@@ -24,7 +53,7 @@ class OllamaClient:
             messages=messages,
             options={"temperature": temperature},
         )
-        return response["message"]["content"]
+        return _message_content(response)
 
     def chat_stream(self, messages: list[dict[str, str]], *, temperature: float = 0.2) -> Iterator[str]:
         response = self.client.chat(
@@ -35,18 +64,16 @@ class OllamaClient:
             options={"temperature": temperature},
         )
         for chunk in response:
-            if not isinstance(chunk, dict):
-                continue
-            message = chunk.get("message")
-            if not isinstance(message, dict):
-                continue
-            content = str(message.get("content") or "")
+            content = _message_content(chunk)
             if content:
                 yield content
 
     def embed(self, text: str) -> list[float]:
         response = self.client.embeddings(model=settings.ollama_embed_model, prompt=text)
-        return response["embedding"]
+        vector = _embedding_vector(response)
+        if vector:
+            return vector
+        raise ValueError("Ollama embedding response did not include an embedding vector")
 
 
 def get_llm() -> OllamaClient:
