@@ -457,6 +457,7 @@ h3 {
 .chat-messages {
   display: grid;
   align-content: start;
+  align-items: start;
   gap: 12px;
   min-height: 0;
   overflow: auto;
@@ -471,6 +472,8 @@ h3 {
 }
 
 .message {
+  align-self: start;
+  height: fit-content;
   max-width: min(78%, 720px);
   border: 1px solid var(--line);
   border-radius: 24px;
