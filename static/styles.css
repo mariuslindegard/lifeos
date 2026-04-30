@@ -456,6 +456,7 @@ h3 {
 
 .chat-messages {
   display: grid;
+  align-content: start;
   gap: 12px;
   min-height: 0;
   overflow: auto;
