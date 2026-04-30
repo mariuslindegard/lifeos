@@ -53,6 +53,8 @@ services:
       - ollama_data:/root/.ollama
     ports:
       - "11434:11434"
+    environment:
+      - OLLAMA_DEBUG=1
 
   ollama-pull:
     image: ollama/ollama:latest
