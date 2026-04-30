@@ -83,24 +83,6 @@ def test_ollama_stream_reader_supports_typed_chat_response_objects() -> None:
     assert "".join(client.chat_stream([{"role": "user", "content": "Hi"}])) == "Hello world"
 
 
-def test_ollama_stream_reader_surfaces_thinking_and_content() -> None:
-    client = OllamaClient()
-
-    def fake_chat(**_kwargs):
-        return iter(
-            [
-                ollama_types.ChatResponse(message=ollama_types.Message(role="assistant", content="", thinking="Need context.")),
-                ollama_types.ChatResponse(message=ollama_types.Message(role="assistant", content="Hello", thinking=None)),
-            ]
-        )
-
-    client.client.chat = fake_chat
-    assert list(client.chat_stream_events([{"role": "user", "content": "Hi"}])) == [
-        {"thinking": "Need context.", "content": ""},
-        {"thinking": "", "content": "Hello"},
-    ]
-
-
 def test_auth_required_and_overview_endpoint() -> None:
     with TestClient(app) as client:
         assert client.get("/api/overview").status_code == 401
@@ -398,14 +380,8 @@ def test_chat_history_time_item_actions_and_message_storage_still_work(monkeypat
 def test_chat_stream_endpoint_emits_working_notes_then_answer_and_persists_final_message(monkeypatch) -> None:
     monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.7, 0.1, 0.2])
     monkeypatch.setattr(
-        "lifeos.llm.OllamaClient.chat_stream_events",
-        lambda self, messages, temperature=0.2, think=True: iter(
-            [
-                {"thinking": "Checking context.", "content": ""},
-                {"thinking": "", "content": "Here is "},
-                {"thinking": "", "content": "a streamed reply."},
-            ]
-        ),
+        "lifeos.llm.OllamaClient.chat_stream",
+        lambda self, messages, temperature=0.2: iter(["Here is ", "a streamed reply."]),
     )
 
     body = ""
@@ -421,7 +397,6 @@ def test_chat_stream_endpoint_emits_working_notes_then_answer_and_persists_final
         event_names = [event for event, _payload in frames]
         assert event_names[0] == "session"
         assert "working_note" in event_names
-        assert "thinking_delta" in event_names
         assert event_names.index("answer_start") < event_names.index("answer_delta")
         assert event_names[-2:] == ["sources", "done"]
 

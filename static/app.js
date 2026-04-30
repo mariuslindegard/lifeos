@@ -532,7 +532,6 @@ async function streamChatResponse(message) {
   let workingNode = addMessage("assistant", "Working...", true, "working-note");
   let answerNode = null;
   let terminalError = null;
-  let thinkingSeen = false;
 
   function handleStreamEvent(eventName, payload) {
     if (eventName === "session") {
@@ -543,28 +542,7 @@ async function streamChatResponse(message) {
       if (!workingNode) {
         workingNode = addMessage("assistant", "", true, "working-note");
       }
-      if (thinkingSeen) {
-        return;
-      }
       setMessageText(workingNode, payload.text || "Working...");
-      return;
-    }
-    if (eventName === "thinking_delta") {
-      if (!workingNode) {
-        workingNode = addMessage("assistant", "", true, "working-note");
-      }
-      const delta = payload.text || "";
-      if (!delta) {
-        return;
-      }
-      if (!thinkingSeen) {
-        thinkingSeen = true;
-        const existing = workingNode.textContent.trim();
-        workingNode.textContent = existing ? `${existing}\n\n${delta}` : delta;
-      } else {
-        workingNode.textContent += delta;
-      }
-      $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
       return;
     }
     if (eventName === "answer_start") {
