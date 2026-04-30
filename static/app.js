@@ -6,6 +6,11 @@ const state = {
   persona: null,
   historySessions: [],
   chatStreaming: false,
+  screenScroll: {
+    overview: 0,
+    chat: null,
+    persona: 0,
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -61,6 +66,39 @@ function showApp() {
   $("#loginView").hidden = true;
   $("#appView").hidden = false;
   setScreen(state.activeScreen);
+}
+
+function screenScroller(screen = state.activeScreen) {
+  if (screen === "overview") return $("#overviewContent");
+  if (screen === "chat") return $("#chatMessages");
+  if (screen === "persona") return $("#personaContent");
+  return null;
+}
+
+function saveScreenScroll(screen = state.activeScreen) {
+  const node = screenScroller(screen);
+  if (!node) return;
+  state.screenScroll[screen] = node.scrollTop;
+}
+
+function scrollChatToLatest() {
+  const chat = $("#chatMessages");
+  chat.scrollTop = chat.scrollHeight;
+  state.screenScroll.chat = chat.scrollTop;
+}
+
+function restoreScreenScroll(screen = state.activeScreen) {
+  const node = screenScroller(screen);
+  if (!node) return;
+  if (screen === "chat") {
+    if (state.screenScroll.chat == null) {
+      scrollChatToLatest();
+      return;
+    }
+    node.scrollTop = state.screenScroll.chat;
+    return;
+  }
+  node.scrollTop = state.screenScroll[screen] || 0;
 }
 
 function empty(container, text) {
@@ -191,6 +229,7 @@ function renderPersonaSummaryCard(title, text) {
 function renderOverview(data) {
   state.overview = data;
   const container = $("#overviewContent");
+  const previousTop = container.scrollTop;
   container.innerHTML = "";
   $("#agentStatus").textContent = data.latest_run?.status || "Idle";
 
@@ -289,6 +328,10 @@ function renderOverview(data) {
   surface.appendChild(milestoneSection);
 
   container.appendChild(surface);
+  if (state.activeScreen === "overview") {
+    container.scrollTop = previousTop;
+    state.screenScroll.overview = container.scrollTop;
+  }
 }
 
 function renderPersonaGroup(title, items) {
@@ -324,6 +367,7 @@ function renderPersonaGroup(title, items) {
 function renderPersona(data) {
   state.persona = data;
   const container = $("#personaContent");
+  const previousTop = container.scrollTop;
   container.innerHTML = "";
   const profile = data.stable_profile || {};
 
@@ -396,6 +440,10 @@ function renderPersona(data) {
 
   wrapper.append(formCard, inferredCard);
   container.appendChild(wrapper);
+  if (state.activeScreen === "persona") {
+    container.scrollTop = previousTop;
+    state.screenScroll.persona = container.scrollTop;
+  }
 }
 
 function renderChatHistory(messages) {
@@ -405,7 +453,7 @@ function renderChatHistory(messages) {
     addMessage(message.role === "assistant" ? "assistant" : "user", message.content, false);
     state.sessionId = message.session_id || state.sessionId;
   }
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatToLatest();
 }
 
 function addMessage(role, text, scroll = true, extraClass = "") {
@@ -417,7 +465,7 @@ function addMessage(role, text, scroll = true, extraClass = "") {
   node.textContent = text;
   $("#chatMessages").appendChild(node);
   if (scroll) {
-    $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+    scrollChatToLatest();
   }
   return node;
 }
@@ -425,7 +473,7 @@ function addMessage(role, text, scroll = true, extraClass = "") {
 function setMessageText(node, text) {
   if (!node) return;
   node.textContent = text;
-  $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+  scrollChatToLatest();
 }
 
 function removeMessage(node) {
@@ -479,6 +527,7 @@ async function loadChatSession(sessionId) {
 }
 
 function setScreen(screen) {
+  saveScreenScroll();
   state.activeScreen = ["overview", "chat", "persona"].includes(screen) ? screen : "overview";
   $("#overviewView").hidden = state.activeScreen !== "overview";
   $("#chatView").hidden = state.activeScreen !== "chat";
@@ -486,6 +535,7 @@ function setScreen(screen) {
   $("#overviewNavButton").classList.toggle("active", state.activeScreen === "overview");
   $("#chatNavButton").classList.toggle("active", state.activeScreen === "chat");
   $("#personaNavButton").classList.toggle("active", state.activeScreen === "persona");
+  restoreScreenScroll();
 }
 
 async function refreshAppData() {
@@ -499,6 +549,8 @@ async function loadLatestChatSession() {
   state.historySessions = sessions.sessions || [];
   if (!state.historySessions.length) {
     $("#chatMessages").innerHTML = "";
+    state.sessionId = null;
+    state.screenScroll.chat = 0;
     return;
   }
   const latest = state.historySessions[0];
@@ -564,7 +616,7 @@ async function streamChatResponse(message) {
       } else {
         workingNode.textContent += delta;
       }
-      $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+      scrollChatToLatest();
       return;
     }
     if (eventName === "answer_start") {
@@ -582,7 +634,7 @@ async function streamChatResponse(message) {
         answerNode = addMessage("assistant", "", true);
       }
       answerNode.textContent += payload.text || "";
-      $("#chatMessages").scrollTop = $("#chatMessages").scrollHeight;
+      scrollChatToLatest();
       return;
     }
     if (eventName === "error") {
@@ -629,6 +681,15 @@ async function streamChatResponse(message) {
   }
 }
 
+function startNewChat() {
+  state.sessionId = null;
+  state.screenScroll.chat = 0;
+  $("#chatMessages").innerHTML = "";
+  closeHistory();
+  setScreen("chat");
+  $("#chatInput").focus();
+}
+
 async function boot() {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -666,6 +727,11 @@ $("#overviewNavButton").addEventListener("click", () => setScreen("overview"));
 $("#chatNavButton").addEventListener("click", () => setScreen("chat"));
 $("#personaNavButton").addEventListener("click", () => setScreen("persona"));
 $("#historyButton").addEventListener("click", () => openHistory());
+$("#newChatButton").addEventListener("click", () => startNewChat());
+
+$("#overviewContent").addEventListener("scroll", () => saveScreenScroll("overview"));
+$("#chatMessages").addEventListener("scroll", () => saveScreenScroll("chat"));
+$("#personaContent").addEventListener("scroll", () => saveScreenScroll("persona"));
 
 $("#chatForm").addEventListener("submit", async (event) => {
   event.preventDefault();

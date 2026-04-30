@@ -101,15 +101,18 @@ textarea {
 }
 
 .app-view {
-  min-height: 100vh;
-  min-height: 100svh;
+  height: 100vh;
+  height: 100svh;
   padding: max(18px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
     calc(94px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+  overflow: hidden;
 }
 
 .screen-view {
   width: min(1120px, 100%);
   margin: 0 auto;
+  height: 100%;
+  min-height: 0;
 }
 
 .topbar,
@@ -210,6 +213,16 @@ h3 {
 .overview-shell,
 .persona-shell {
   display: grid;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+#overviewView,
+#personaView {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0;
 }
 
 .reflection-surface,
@@ -434,11 +447,10 @@ h3 {
 }
 
 .chat-screen {
-  min-height: calc(100vh - 124px - env(safe-area-inset-bottom));
-  min-height: calc(100svh - 124px - env(safe-area-inset-bottom));
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 14px;
+  min-height: 0;
 }
 
 .chat-messages {
@@ -446,7 +458,7 @@ h3 {
   gap: 12px;
   min-height: 0;
   overflow: auto;
-  padding: 6px 2px 4px;
+  padding: 6px 2px 12px;
 }
 
 .message {
@@ -507,6 +519,18 @@ h3 {
   background: rgba(24, 20, 18, 0.94);
   box-shadow: var(--shadow);
   backdrop-filter: blur(18px);
+}
+
+@media (max-width: 860px) {
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 12;
+    padding: 4px 0 12px;
+    background:
+      linear-gradient(180deg, rgba(24, 20, 18, 0.96) 0%, rgba(24, 20, 18, 0.82) 75%, rgba(24, 20, 18, 0) 100%);
+    backdrop-filter: blur(14px);
+  }
 }
 
 .nav-button {
