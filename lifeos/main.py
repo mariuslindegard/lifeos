@@ -21,6 +21,7 @@ from lifeos.agent import (
     record_chat_turn,
     refresh_overview_card,
     run_job,
+    stream_assistant_message_events,
     stream_chat_turn_events,
 )
 from lifeos.auth import clear_session_cookie, require_user, set_session_cookie, verify_password
@@ -316,6 +317,32 @@ def chat_stream(payload: ChatRequest, _user=Depends(require_user)) -> StreamingR
                 yield sse_frame(str(event["event"]), event.get("data", {}))
         finally:
             db.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/chat/stream/live")
+def chat_stream_live(
+    assistant_message_id: int,
+    session_id: int | None = None,
+    known_content_length: int = 0,
+    known_thinking_length: int = 0,
+    last_working_note: str = "",
+    _user=Depends(require_user),
+) -> StreamingResponse:
+    def event_stream():
+        for event in stream_assistant_message_events(
+            assistant_message_id,
+            session_id=session_id,
+            known_content_length=known_content_length,
+            known_thinking_length=known_thinking_length,
+            last_working_note=last_working_note,
+        ):
+            yield sse_frame(str(event["event"]), event.get("data", {}))
 
     return StreamingResponse(
         event_stream(),

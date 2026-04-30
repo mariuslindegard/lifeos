@@ -2105,10 +2105,21 @@ def stream_chat_turn_events(
         create_new_session=create_new_session,
     )
     yield {"event": "session", "data": {"session_id": persisted_session_id, "assistant_message_id": assistant_message_id}}
+    yield from stream_assistant_message_events(assistant_message_id, session_id=persisted_session_id)
+
+
+def stream_assistant_message_events(
+    assistant_message_id: int,
+    *,
+    session_id: int | None = None,
+    known_content_length: int = 0,
+    known_thinking_length: int = 0,
+    last_working_note: str = "",
+) -> Any:
     last_note = None
-    last_thinking = ""
-    last_content = ""
-    answer_started = False
+    thinking_offset = max(0, known_thinking_length)
+    content_offset = max(0, known_content_length)
+    answer_started = content_offset > 0
     sources_sent = False
     while True:
         poll_db = SessionLocal()
@@ -2117,27 +2128,34 @@ def stream_chat_turn_events(
             if not assistant:
                 yield {"event": "error", "data": {"message": "Chat response was not found."}}
                 return
+            if session_id is not None and assistant.session_id != session_id:
+                yield {"event": "error", "data": {"message": "Chat response does not belong to that session."}}
+                return
             metadata = dict(assistant.metadata_ or {})
             note = str(metadata.get("working_note") or "")
             thinking = str(metadata.get("thinking") or "")
             content = assistant.content or ""
 
-            if note and note != last_note and not answer_started and not content and not thinking:
+            if note and note != last_working_note and not answer_started and not content and not thinking:
                 last_note = note
+                last_working_note = note
                 yield {"event": "working_note", "data": {"text": note}}
 
-            if thinking.startswith(last_thinking) and len(thinking) > len(last_thinking) and not answer_started:
-                delta = thinking[len(last_thinking):]
-                last_thinking = thinking
+            if not answer_started and thinking:
+                thinking_offset = min(thinking_offset, len(thinking))
+            if not answer_started and len(thinking) > thinking_offset:
+                delta = thinking[thinking_offset:]
+                thinking_offset = len(thinking)
                 yield {"event": "thinking_delta", "data": {"text": delta}}
 
             if content:
                 if not answer_started:
                     yield {"event": "answer_start", "data": {}}
                     answer_started = True
-                if content.startswith(last_content) and len(content) > len(last_content):
-                    delta = content[len(last_content):]
-                    last_content = content
+                content_offset = min(content_offset, len(content))
+                if len(content) > content_offset:
+                    delta = content[content_offset:]
+                    content_offset = len(content)
                     yield {"event": "answer_delta", "data": {"text": delta}}
 
             if assistant.analysis_status == "complete":
@@ -2149,12 +2167,13 @@ def stream_chat_turn_events(
 
             if assistant.analysis_status == "error":
                 error_message = assistant.analysis_error or assistant.content or "Streaming failed."
-                if assistant.content and assistant.content.startswith(last_content) and len(assistant.content) > len(last_content):
-                    delta = assistant.content[len(last_content):]
+                content_offset = min(content_offset, len(assistant.content or ""))
+                if assistant.content and len(assistant.content) > content_offset:
+                    delta = assistant.content[content_offset:]
                     if not answer_started:
                         yield {"event": "answer_start", "data": {}}
                         answer_started = True
-                    last_content = assistant.content
+                    content_offset = len(assistant.content)
                     yield {"event": "answer_delta", "data": {"text": delta}}
                 yield {"event": "error", "data": {"message": error_message}}
                 return

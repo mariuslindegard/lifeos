@@ -1,6 +1,8 @@
 import os
 import tempfile
 import json
+import threading
+import time as clock
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,7 +18,7 @@ from fastapi.testclient import TestClient
 from ollama import _types as ollama_types
 from sqlalchemy import inspect
 
-from lifeos.agent import add_memory, latest_completed_local_day
+from lifeos.agent import add_memory, create_assistant_placeholder, get_or_create_chat_session, latest_completed_local_day
 from lifeos.db import SessionLocal, engine
 from lifeos.llm import OllamaClient
 from lifeos.main import app
@@ -489,6 +491,50 @@ def test_chat_stream_supports_deterministic_history_answers_without_persisting_n
         db.close()
 
 
+def test_live_chat_stream_resumes_from_existing_partial_answer() -> None:
+    clear_runtime_rows()
+    db = SessionLocal()
+    try:
+        session = get_or_create_chat_session(db, create_new_session=True)
+        assistant = create_assistant_placeholder(db, session=session, working_note="Drafting the final answer.")
+        assistant.content = "Partial "
+        assistant.metadata_ = {"working_note": "Drafting the final answer.", "thinking": ""}
+        db.commit()
+        session_id = session.id
+        assistant_id = assistant.id
+    finally:
+        db.close()
+
+    def finish_message() -> None:
+        clock.sleep(0.1)
+        worker = SessionLocal()
+        try:
+          message = worker.get(ChatMessage, assistant_id)
+          assert message is not None
+          message.content = "Partial answer."
+          message.analysis_status = "complete"
+          message.sources = [{"type": "note", "id": 1}]
+          worker.commit()
+        finally:
+          worker.close()
+
+    threading.Thread(target=finish_message, daemon=True).start()
+
+    body = ""
+    with TestClient(app) as client:
+        login(client)
+        with client.stream(
+            "GET",
+            f"/api/chat/stream/live?assistant_message_id={assistant_id}&session_id={session_id}&known_content_length=8",
+        ) as response:
+            assert response.status_code == 200
+            body = "".join(response.iter_text())
+
+    frames = parse_sse_frames(body)
+    assert [event for event, _payload in frames] == ["answer_delta", "sources", "done"]
+    assert frames[0][1]["text"] == "answer."
+
+
 def test_memory_update_increases_confidence(monkeypatch) -> None:
     monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.0, 1.0, 0.0])
     with TestClient(app):
@@ -547,4 +593,4 @@ def test_frontend_markup_and_assets_match_new_shell() -> None:
     assert "persona-layout" in css
     assert "history-section" in css
     assert "brief-grid" not in css
-    assert 'CACHE_NAME = "lifeos-v13"' in sw
+    assert 'CACHE_NAME = "lifeos-v14"' in sw
