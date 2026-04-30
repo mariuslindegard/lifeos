@@ -1,4 +1,5 @@
 import re
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1793,7 +1794,7 @@ def historical_analysis_messages(
     )
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Historical context:\n{payload}\n\nQuestion:\n{message}"},
+        {"role": "user", "content": f"Historical context JSON:\n{json.dumps(payload, ensure_ascii=False)}\n\nQuestion:\n{message}"},
     ]
 
 
@@ -1805,7 +1806,7 @@ def semantic_answer_messages(message: str, payload: dict[str, Any]) -> list[dict
     )
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Database context:\n{payload}\n\nQuestion:\n{message}"},
+        {"role": "user", "content": f"Database context JSON:\n{json.dumps(payload, ensure_ascii=False)}\n\nQuestion:\n{message}"},
     ]
 
 
@@ -1866,6 +1867,37 @@ def stream_chat_turn_events(
         yield {"event": "sources", "data": {"items": all_sources}}
         yield {"event": "done", "data": {}}
 
+    def stream_llm_answer(
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        fallback_text: str,
+    ) -> Any:
+        final_parts = [prefix_text]
+        started = False
+        if prefix_text:
+            yield {"event": "answer_start", "data": {}}
+            started = True
+            for chunk in stream_text_chunks(prefix_text):
+                yield {"event": "answer_delta", "data": {"text": chunk}}
+        try:
+            for delta in get_llm().chat_stream(messages, temperature=temperature):
+                if not started:
+                    yield {"event": "answer_start", "data": {}}
+                    started = True
+                final_parts.append(delta)
+                yield {"event": "answer_delta", "data": {"text": delta}}
+        except Exception:
+            if not started:
+                yield {"event": "answer_start", "data": {}}
+                started = True
+            final_parts = [prefix_text, fallback_text]
+            for chunk in stream_text_chunks(fallback_text):
+                yield {"event": "answer_delta", "data": {"text": chunk}}
+        if not started:
+            yield {"event": "answer_start", "data": {}}
+        return "".join(final_parts)
+
     try:
         persona = ensure_persona(db)
         timezone_name = persona.timezone or settings.default_timezone
@@ -1889,27 +1921,12 @@ def stream_chat_turn_events(
                         history,
                     )
                     return
-                final_parts = [prefix_text]
-                yield {"event": "answer_start", "data": {}}
-                if prefix_text:
-                    for chunk in stream_text_chunks(prefix_text):
-                        yield {"event": "answer_delta", "data": {"text": chunk}}
-                streamed = False
-                try:
-                    for delta in get_llm().chat_stream(
-                        historical_analysis_messages(message, left_context, comparison=right_context),
-                        temperature=0.1,
-                    ):
-                        streamed = True
-                        final_parts.append(delta)
-                        yield {"event": "answer_delta", "data": {"text": delta}}
-                except Exception:
-                    fallback = fallback_historical_analysis(message, left_context, timezone_name, comparison=right_context)
-                    if not streamed:
-                        final_parts = [prefix_text, fallback]
-                        for chunk in stream_text_chunks(fallback):
-                            yield {"event": "answer_delta", "data": {"text": chunk}}
-                full_answer = "".join(final_parts)
+                fallback = fallback_historical_analysis(message, left_context, timezone_name, comparison=right_context)
+                full_answer = yield from stream_llm_answer(
+                    historical_analysis_messages(message, left_context, comparison=right_context),
+                    temperature=0.1,
+                    fallback_text=fallback,
+                )
                 all_sources = prefix_sources + history
                 persist_assistant_turn(db, session, full_answer, all_sources)
                 yield {"event": "sources", "data": {"items": all_sources}}
@@ -1929,24 +1946,12 @@ def stream_chat_turn_events(
                 if not context_has_data(context):
                     yield from finish_with_text(f"I could not find enough grounded data to analyze {context.window.label}.", history)
                     return
-                final_parts = [prefix_text]
-                yield {"event": "answer_start", "data": {}}
-                if prefix_text:
-                    for chunk in stream_text_chunks(prefix_text):
-                        yield {"event": "answer_delta", "data": {"text": chunk}}
-                streamed = False
-                try:
-                    for delta in get_llm().chat_stream(historical_analysis_messages(message, context), temperature=0.1):
-                        streamed = True
-                        final_parts.append(delta)
-                        yield {"event": "answer_delta", "data": {"text": delta}}
-                except Exception:
-                    fallback = fallback_historical_analysis(message, context, timezone_name)
-                    if not streamed:
-                        final_parts = [prefix_text, fallback]
-                        for chunk in stream_text_chunks(fallback):
-                            yield {"event": "answer_delta", "data": {"text": chunk}}
-                full_answer = "".join(final_parts)
+                fallback = fallback_historical_analysis(message, context, timezone_name)
+                full_answer = yield from stream_llm_answer(
+                    historical_analysis_messages(message, context),
+                    temperature=0.1,
+                    fallback_text=fallback,
+                )
                 all_sources = prefix_sources + history
                 persist_assistant_turn(db, session, full_answer, all_sources)
                 yield {"event": "sources", "data": {"items": all_sources}}
@@ -1964,29 +1969,17 @@ def stream_chat_turn_events(
         ]
         payload = {"semantic_matches": semantic, "recent_context": context}
         yield {"event": "working_note", "data": {"text": "Drafting the final answer from your local context."}}
-        final_parts = [prefix_text]
-        yield {"event": "answer_start", "data": {}}
-        if prefix_text:
-            for chunk in stream_text_chunks(prefix_text):
-                yield {"event": "answer_delta", "data": {"text": chunk}}
-        streamed = False
-        try:
-            for delta in get_llm().chat_stream(semantic_answer_messages(message, payload), temperature=0.2):
-                streamed = True
-                final_parts.append(delta)
-                yield {"event": "answer_delta", "data": {"text": delta}}
-        except Exception:
-            if semantic:
-                fallback = "I found related local context, but Ollama is not reachable yet:\n" + "\n".join(
-                    f"- {item['content']}" for item in semantic[:4]
-                )
-            else:
-                fallback = "I do not have enough local context yet, and Ollama is not reachable. Add logs or start Ollama, then ask again."
-            if not streamed:
-                final_parts = [prefix_text, fallback]
-                for chunk in stream_text_chunks(fallback):
-                    yield {"event": "answer_delta", "data": {"text": chunk}}
-        full_answer = "".join(final_parts)
+        if semantic:
+            fallback = "I found related local context, but Ollama is not reachable yet:\n" + "\n".join(
+                f"- {item['content']}" for item in semantic[:4]
+            )
+        else:
+            fallback = "I do not have enough local context yet, and Ollama is not reachable. Add logs or start Ollama, then ask again."
+        full_answer = yield from stream_llm_answer(
+            semantic_answer_messages(message, payload),
+            temperature=0.2,
+            fallback_text=fallback,
+        )
         all_sources = prefix_sources + semantic
         persist_assistant_turn(db, session, full_answer, all_sources)
         yield {"event": "sources", "data": {"items": all_sources}}
