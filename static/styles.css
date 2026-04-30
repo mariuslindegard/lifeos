@@ -216,6 +216,7 @@ h3 {
   min-height: 0;
   overflow: auto;
   padding-right: 2px;
+  scrollbar-width: none;
 }
 
 #overviewView,
@@ -458,7 +459,14 @@ h3 {
   gap: 12px;
   min-height: 0;
   overflow: auto;
-  padding: 6px 2px 12px;
+  padding: 6px 2px 4px;
+  scrollbar-width: none;
+}
+
+.overview-shell::-webkit-scrollbar,
+.persona-shell::-webkit-scrollbar,
+.chat-messages::-webkit-scrollbar {
+  display: none;
 }
 
 .message {
@@ -484,8 +492,6 @@ h3 {
 }
 
 .composer {
-  position: sticky;
-  bottom: calc(78px + env(safe-area-inset-bottom));
   gap: 10px;
   padding: 8px;
   border: 1px solid var(--line);
