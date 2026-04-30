@@ -305,6 +305,23 @@ def test_chat_session_rolls_after_six_hours(monkeypatch) -> None:
         assert second["session_id"] != old_session_id
 
 
+def test_chat_can_force_a_new_session_even_when_latest_session_is_active(monkeypatch) -> None:
+    monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.0, 0.0, 1.0])
+
+    with TestClient(app) as client:
+        login(client)
+        first = client.post("/api/chat", json={"message": "Keep this in the first chat."}).json()
+        second = client.post(
+            "/api/chat",
+            json={"message": "Start a clean chat.", "create_new_session": True},
+        ).json()
+        assert second["session_id"] != first["session_id"]
+        history = client.get(f"/api/chat/history?session_id={second['session_id']}").json()
+        contents = [item["content"] for item in history["messages"]]
+        assert "Start a clean chat." in contents
+        assert "Keep this in the first chat." not in contents
+
+
 def test_removed_mode_jobs_return_404_and_core_jobs_still_work(monkeypatch) -> None:
     monkeypatch.setattr("lifeos.rag.vector_for_text", lambda _content: [0.2, 0.2, 0.2])
 
@@ -530,4 +547,4 @@ def test_frontend_markup_and_assets_match_new_shell() -> None:
     assert "persona-layout" in css
     assert "history-section" in css
     assert "brief-grid" not in css
-    assert 'CACHE_NAME = "lifeos-v11"' in sw
+    assert 'CACHE_NAME = "lifeos-v12"' in sw

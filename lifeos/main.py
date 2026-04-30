@@ -289,7 +289,12 @@ def chat_history(session_id: int | None = None, db: Session = Depends(get_db), _
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, db: Session = Depends(get_db), _user=Depends(require_user)) -> ChatResponse:
-    answer, sources, session_id = record_chat_turn(db, payload.message, session_id=payload.session_id)
+    answer, sources, session_id = record_chat_turn(
+        db,
+        payload.message,
+        session_id=payload.session_id,
+        create_new_session=payload.create_new_session,
+    )
     return ChatResponse(answer=answer, session_id=session_id, sources=sources)
 
 
@@ -302,7 +307,12 @@ def chat_stream(payload: ChatRequest, _user=Depends(require_user)) -> StreamingR
     def event_stream():
         db = SessionLocal()
         try:
-            for event in stream_chat_turn_events(db, payload.message, session_id=payload.session_id):
+            for event in stream_chat_turn_events(
+                db,
+                payload.message,
+                session_id=payload.session_id,
+                create_new_session=payload.create_new_session,
+            ):
                 yield sse_frame(str(event["event"]), event.get("data", {}))
         finally:
             db.close()

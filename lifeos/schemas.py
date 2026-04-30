@@ -36,6 +36,7 @@ class EventOut(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     session_id: int | None = None
+    create_new_session: bool = False
 
 
 class ChatResponse(BaseModel):

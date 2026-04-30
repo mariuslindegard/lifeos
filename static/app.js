@@ -650,11 +650,12 @@ async function loadLatestChatSession() {
 }
 
 async function streamChatResponse(message) {
+  const createNewSession = state.draftChat && !state.sessionId;
   const response = await fetch("/api/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ message, session_id: state.sessionId }),
+    body: JSON.stringify({ message, session_id: state.sessionId, create_new_session: createNewSession }),
   });
   if (response.status === 401) {
     showLogin();

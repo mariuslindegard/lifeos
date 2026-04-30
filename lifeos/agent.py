@@ -673,10 +673,20 @@ def ensure_persona(db: Session) -> PersonaProfile:
     return persona
 
 
-def get_or_create_chat_session(db: Session, session_id: int | None = None) -> ChatSession:
+def get_or_create_chat_session(
+    db: Session,
+    session_id: int | None = None,
+    *,
+    create_new_session: bool = False,
+) -> ChatSession:
     now = datetime.now(timezone.utc)
     session = db.get(ChatSession, session_id) if session_id else None
     if session and is_session_active(session, now):
+        return session
+    if create_new_session:
+        session = ChatSession(title=f"LifeOS chat {now.astimezone(local_tz()):%Y-%m-%d}", last_message_at=now)
+        db.add(session)
+        db.flush()
         return session
     session = db.query(ChatSession).order_by(desc(ChatSession.last_message_at), desc(ChatSession.updated_at)).first()
     if session and is_session_active(session, now):
@@ -718,8 +728,9 @@ def prepare_chat_turn(
     message: str,
     *,
     session_id: int | None = None,
+    create_new_session: bool = False,
 ) -> tuple[ChatSession, ChatMessage, list[TimeItem]]:
-    session = get_or_create_chat_session(db, session_id=session_id)
+    session = get_or_create_chat_session(db, session_id=session_id, create_new_session=create_new_session)
     user_message = add_chat_message(db, session=session, role="user", content=message)
     if is_persona_relevant(message):
         for memory in infer_persona_memories_from_text(db, message, evidence=[{"chat_message_id": user_message.id}]):
@@ -831,8 +842,19 @@ def persist_assistant_turn(db: Session, session: ChatSession, answer: str, sourc
     refresh_overview_card(db)
 
 
-def record_chat_turn(db: Session, message: str, *, session_id: int | None = None) -> tuple[str, list[dict], int]:
-    session, _user_message, created_items = prepare_chat_turn(db, message, session_id=session_id)
+def record_chat_turn(
+    db: Session,
+    message: str,
+    *,
+    session_id: int | None = None,
+    create_new_session: bool = False,
+) -> tuple[str, list[dict], int]:
+    session, _user_message, created_items = prepare_chat_turn(
+        db,
+        message,
+        session_id=session_id,
+        create_new_session=create_new_session,
+    )
     answer, sources = answer_chat(db, message)
     prefix, prefix_sources = created_item_prefix(created_items)
     answer = prefix + answer
@@ -846,8 +868,14 @@ def start_persistent_chat_turn(
     message: str,
     *,
     session_id: int | None = None,
+    create_new_session: bool = False,
 ) -> tuple[int, int]:
-    session, _user_message, created_items = prepare_chat_turn(db, message, session_id=session_id)
+    session, _user_message, created_items = prepare_chat_turn(
+        db,
+        message,
+        session_id=session_id,
+        create_new_session=create_new_session,
+    )
     assistant = create_assistant_placeholder(db, session=session)
     prefix_text, prefix_sources = created_item_prefix(created_items)
     thread = threading.Thread(
@@ -2068,8 +2096,14 @@ def stream_chat_turn_events(
     message: str,
     *,
     session_id: int | None = None,
+    create_new_session: bool = False,
 ) -> Any:
-    persisted_session_id, assistant_message_id = start_persistent_chat_turn(db, message, session_id=session_id)
+    persisted_session_id, assistant_message_id = start_persistent_chat_turn(
+        db,
+        message,
+        session_id=session_id,
+        create_new_session=create_new_session,
+    )
     yield {"event": "session", "data": {"session_id": persisted_session_id, "assistant_message_id": assistant_message_id}}
     last_note = None
     last_thinking = ""
